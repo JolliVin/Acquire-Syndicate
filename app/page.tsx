@@ -8,15 +8,20 @@ export default function Home() {
   const [playerName, setPlayerName] = useState('');
   const [lobbyInfo, setLobbyInfo] = useState<{ name: string, code: string } | null>(null);
   const [isCreating, setIsCreating] = useState(false);
+  const [errorMessage, setErrorMessage] = useState(''); // NEW: Error state
 
-  // Generates a random 6-character alphanumeric code
   const generateJoinCode = () => {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
   };
 
   const handleCreateLobby = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (playerName.trim() === '' || playerName.length > 10) return;
+    setErrorMessage(''); // Clear previous errors
+    
+    if (playerName.trim() === '') {
+      setErrorMessage('Player name cannot be empty.');
+      return;
+    }
     
     setIsCreating(true);
     const joinCode = generateJoinCode();
@@ -30,7 +35,7 @@ export default function Home() {
       .single();
 
     if (lobbyError) {
-      console.error('Error creating lobby:', lobbyError);
+      setErrorMessage(`Lobby Error: ${lobbyError.message}`);
       setIsCreating(false);
       return;
     }
@@ -45,7 +50,7 @@ export default function Home() {
       }]);
 
     if (playerError) {
-      console.error('Error adding player:', playerError);
+      setErrorMessage(`Player Error: ${playerError.message}`);
     } else {
       setLobbyInfo({ name: lobbyName, code: joinCode });
     }
@@ -63,13 +68,13 @@ export default function Home() {
         {view === 'home' && (
           <div className="flex flex-col gap-4">
             <button 
-              onClick={() => setView('create')}
+              onClick={() => { setView('create'); setErrorMessage(''); }}
               className="w-full bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold py-3 px-4 rounded transition-colors"
             >
               CREATE A LOBBY
             </button>
             <button 
-              onClick={() => setView('join')}
+              onClick={() => { setView('join'); setErrorMessage(''); }}
               className="w-full border-2 border-amber-500 text-amber-500 hover:bg-slate-700 font-bold py-3 px-4 rounded transition-colors"
             >
               JOIN A LOBBY
@@ -94,6 +99,14 @@ export default function Home() {
                 placeholder="Enter name..."
               />
             </div>
+            
+            {/* NEW: Error Display Box */}
+            {errorMessage && (
+              <div className="bg-red-500/20 border border-red-500 text-red-300 px-4 py-2 rounded text-sm">
+                {errorMessage}
+              </div>
+            )}
+
             <button 
               type="submit"
               disabled={isCreating}
@@ -103,7 +116,7 @@ export default function Home() {
             </button>
             <button 
               type="button"
-              onClick={() => setView('home')}
+              onClick={() => { setView('home'); setErrorMessage(''); }}
               className="text-sm text-slate-400 hover:text-white mt-2"
             >
               ← Back
