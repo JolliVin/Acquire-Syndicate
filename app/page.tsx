@@ -13,7 +13,15 @@ type Player = {
   play_order?: number;
 };
 
-type Lobby = { id: string; name: string; code: string; status: string; board_state?: string[] };
+type Lobby = { 
+  id: string; 
+  name: string; 
+  code: string; 
+  status: string; 
+  board_state?: string[];
+  tile_pool?: string[];
+  current_turn_index?: number;
+};
 
 export default function Home() {
   const [view, setView] = useState<'home' | 'create' | 'join'>('home');
@@ -29,7 +37,6 @@ export default function Home() {
   const [isStarting, setIsStarting] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
 
-  // Board Constants
   const BOARD_ROWS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
   const BOARD_COLS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
@@ -48,7 +55,7 @@ export default function Home() {
       if (pData) setPlayers(pData);
       
       const { data: lData } = await supabase.from('lobbies').select('*').eq('id', lobbyInfo.id).single();
-      if (lData) setLobbyInfo(prev => prev ? { ...prev, status: lData.status, board_state: lData.board_state } : null);
+      if (lData) setLobbyInfo(prev => prev ? { ...prev, status: lData.status, board_state: lData.board_state, tile_pool: lData.tile_pool, current_turn_index: lData.current_turn_index } : null);
     };
 
     fetchInitialData();
@@ -56,7 +63,13 @@ export default function Home() {
     const lobbyChannel = supabase.channel('lobby-updates')
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'lobbies', filter: `id=eq.${lobbyInfo.id}` }, 
         (payload) => {
-          setLobbyInfo((current) => current ? { ...current, status: payload.new.status, board_state: payload.new.board_state } : null);
+          setLobbyInfo((current) => current ? { 
+            ...current, 
+            status: payload.new.status, 
+            board_state: payload.new.board_state,
+            tile_pool: payload.new.tile_pool,
+            current_turn_index: payload.new.current_turn_index
+          } : null);
         }
       ).subscribe();
 
@@ -150,19 +163,51 @@ export default function Home() {
     }));
 
     await supabase.from('players').upsert(playersUpdates);
-    await supabase.from('lobbies').update({ status: 'playing', board_state: initialBoardState }).eq('id', lobbyInfo!.id);
+    await supabase.from('lobbies').update({ 
+      status: 'playing', 
+      board_state: initialBoardState,
+      tile_pool: pool,
+      current_turn_index: 0
+    }).eq('id', lobbyInfo!.id);
     
     setIsStarting(false);
   };
 
+  // --- NEW: Tile Placement Logic ---
+  const handlePlaceTile = async (tileToPlace: string) => {
+    const currentPlayer = players.find(p => p.play_order === lobbyInfo?.current_turn_index);
+    
+    // Safety checks: Is it actually their turn? Does the lobby exist?
+    if (!lobbyInfo || currentPlayer?.player_name !== playerName) return;
+
+    // 1. Prepare updated hand and board
+    const newHand = currentPlayer.hand?.filter(t => t !== tileToPlace) || [];
+    const newBoardState = [...(lobbyInfo.board_state || []), tileToPlace];
+
+    // 2. Draw a new tile (if there are any left in the pool)
+    const newPool = [...(lobbyInfo.tile_pool || [])];
+    if (newPool.length > 0) {
+      newHand.push(newPool.pop()!);
+    }
+
+    // 3. Advance to the next player's turn
+    const nextTurnIndex = (lobbyInfo.current_turn_index! + 1) % players.length;
+
+    // 4. Update Database
+    await supabase.from('players').update({ hand: newHand }).eq('id', currentPlayer.id);
+    await supabase.from('lobbies').update({
+      board_state: newBoardState,
+      tile_pool: newPool,
+      current_turn_index: nextTurnIndex
+    }).eq('id', lobbyInfo.id);
+  };
+
   return (
     <main className="min-h-screen bg-slate-900 flex items-center justify-center p-4 text-white font-sans">
-      {/* Container expands if the game has started to fit the board */}
       <div className={`w-full bg-slate-800 rounded-xl shadow-2xl p-8 transition-all ${lobbyInfo?.status === 'playing' ? 'max-w-5xl' : 'max-w-md'}`}>
         
         <h1 className="text-3xl font-bold text-center mb-8 tracking-wider text-amber-400">ACQUIRE SYNDICATE</h1>
 
-        {/* --- LOBBY & WAITING ROOM VIEWS (unchanged) --- */}
         {view === 'home' && !lobbyInfo && (
           <div className="flex flex-col gap-4">
             <button onClick={() => { setView('create'); setErrorMessage(''); }} className="w-full bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold py-3 px-4 rounded transition-colors">CREATE A LOBBY</button>
@@ -228,11 +273,9 @@ export default function Home() {
           </div>
         )}
 
-        {/* --- NEW: LIVE BOARD VIEW --- */}
         {lobbyInfo && lobbyInfo.status === 'playing' && (
           <div className="flex flex-col lg:flex-row gap-8">
             
-            {/* Left Side: Game Board Grid */}
             <div className="flex-grow bg-slate-900 p-4 rounded-xl border border-slate-700 overflow-x-auto">
               <div className="min-w-max">
                 <div className="grid grid-cols-12 gap-1 sm:gap-2">
@@ -260,38 +303,67 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Right Side: Player Data */}
             <div className="w-full lg:w-72 space-y-4">
-              <h3 className="font-bold text-slate-300 border-b border-slate-700 pb-2">
-                Turn Order
-              </h3>
+              <div className="flex justify-between items-center border-b border-slate-700 pb-2">
+                <h3 className="font-bold text-slate-300">Turn Order</h3>
+                <span className="text-xs text-slate-400">Tiles left: {lobbyInfo.tile_pool?.length || 0}</span>
+              </div>
               
               <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
-                {[...players].sort((a, b) => (a.play_order || 0) - (b.play_order || 0)).map((p, idx) => (
-                  <div key={p.id} className="bg-slate-700 p-3 rounded-lg border border-slate-600 shadow-sm">
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="font-bold text-white text-sm">
-                        {idx + 1}. {p.player_name}
-                      </span>
-                      <span className="text-amber-400 font-mono text-sm">${p.money}</span>
-                    </div>
-                    
-                    <div className="text-xs text-slate-400 mb-1">
-                      Start Tile: <span className="text-white font-mono bg-slate-800 px-1 rounded">{p.starting_tile}</span>
-                    </div>
-                    
-                    <div className="text-xs text-slate-400">
-                      Hand:
-                      <div className="flex flex-wrap gap-1 mt-1">
-                        {p.hand?.map(tile => (
-                          <span key={tile} className="bg-slate-800 text-white font-mono px-1.5 py-0.5 rounded border border-slate-600">
-                            {tile}
-                          </span>
-                        ))}
+                {[...players].sort((a, b) => (a.play_order || 0) - (b.play_order || 0)).map((p, idx) => {
+                  const isCurrentTurn = lobbyInfo.current_turn_index === p.play_order;
+                  const isMe = p.player_name === playerName;
+
+                  return (
+                    <div 
+                      key={p.id} 
+                      className={`p-3 rounded-lg border shadow-sm transition-all
+                        ${isCurrentTurn ? 'bg-slate-600 border-amber-400' : 'bg-slate-700 border-slate-600'}
+                      `}
+                    >
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="font-bold text-white text-sm flex items-center gap-2">
+                          {idx + 1}. {p.player_name} {isMe && <span className="text-[10px] bg-slate-500 px-1 rounded uppercase">You</span>}
+                        </span>
+                        <span className="text-amber-400 font-mono text-sm">${p.money}</span>
+                      </div>
+                      
+                      <div className="text-xs text-slate-400 mb-2">
+                        Start Tile: <span className="text-white font-mono bg-slate-800 px-1 rounded">{p.starting_tile}</span>
+                      </div>
+                      
+                      <div className="text-xs text-slate-400">
+                        Hand:
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {/* NEW: Conditional Hand Rendering */}
+                          {!isMe ? (
+                            // Hide opponents' tiles (Render face-down blocks)
+                            p.hand?.map((_, i) => (
+                              <span key={i} className="w-6 h-8 bg-slate-800 rounded border border-slate-600"></span>
+                            ))
+                          ) : (
+                            // Show my tiles (Render as clickable buttons if it's my turn)
+                            p.hand?.map(tile => (
+                              <button 
+                                key={tile} 
+                                onClick={() => handlePlaceTile(tile)}
+                                disabled={!isCurrentTurn}
+                                className={`
+                                  font-mono px-2 py-1 rounded border transition-colors
+                                  ${isCurrentTurn 
+                                    ? 'bg-amber-500 text-slate-900 border-amber-600 hover:bg-amber-400 cursor-pointer font-bold' 
+                                    : 'bg-slate-800 text-slate-400 border-slate-600 cursor-not-allowed'}
+                                `}
+                              >
+                                {tile}
+                              </button>
+                            ))
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             </div>
 
