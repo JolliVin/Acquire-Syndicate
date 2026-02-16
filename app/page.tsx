@@ -29,11 +29,14 @@ export default function Home() {
   const [isStarting, setIsStarting] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
 
-  // Helper function to rank tiles (1A is lowest, 12I is highest)
+  // Board Constants
+  const BOARD_ROWS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
+  const BOARD_COLS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
   const getTileValue = (tile: string) => {
     const number = parseInt(tile.match(/\d+/)?.[0] || '0');
     const letter = tile.match(/[A-I]/)?.[0] || 'A';
-    const letterValue = letter.charCodeAt(0) - 65; // A=0, B=1, C=2...
+    const letterValue = letter.charCodeAt(0) - 65; 
     return (letterValue * 100) + number;
   };
 
@@ -50,7 +53,6 @@ export default function Home() {
 
     fetchInitialData();
 
-    // Listen for Game Start (Lobby Updates)
     const lobbyChannel = supabase.channel('lobby-updates')
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'lobbies', filter: `id=eq.${lobbyInfo.id}` }, 
         (payload) => {
@@ -58,7 +60,6 @@ export default function Home() {
         }
       ).subscribe();
 
-    // Listen for Player Updates (Joining & Receiving Hands)
     const playerChannel = supabase.channel('player-updates')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'players', filter: `lobby_id=eq.${lobbyInfo.id}` },
         (payload) => {
@@ -116,23 +117,18 @@ export default function Home() {
     setIsJoining(false);
   };
 
-  // --- THE GAME INITIALIZATION ENGINE ---
   const handleStartGame = async () => {
     setIsStarting(true);
 
-    // 1. Generate the 108 Tile Pool
-    const rows = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
     let pool: string[] = [];
-    for (let r of rows) {
-      for (let c = 1; c <= 12; c++) {
+    for (let r of BOARD_ROWS) {
+      for (let c of BOARD_COLS) {
         pool.push(`${c}${r}`);
       }
     }
 
-    // 2. Shuffle the tiles
     pool = pool.sort(() => Math.random() - 0.5);
 
-    // 3. Draw initial setup tiles and rank players
     let initialBoardState: string[] = [];
     const playersWithStarts = players.map(p => {
       const startingTile = pool.pop()!;
@@ -140,10 +136,8 @@ export default function Home() {
       return { ...p, starting_tile: startingTile, tile_value: getTileValue(startingTile) };
     });
 
-    // Sort to determine play order (lowest tile value goes first)
     playersWithStarts.sort((a, b) => a.tile_value - b.tile_value);
 
-    // 4. Deal $6000 and 6 Hand Tiles to everyone, maintaining turn order
     const playersUpdates = playersWithStarts.map((p, index) => ({
       id: p.id,
       lobby_id: lobbyInfo!.id,
@@ -151,11 +145,10 @@ export default function Home() {
       is_host: p.is_host,
       money: 6000,
       starting_tile: p.starting_tile,
-      hand: pool.splice(-6), // Take 6 tiles off the top
-      play_order: index // 0 goes first, 1 goes second, etc.
+      hand: pool.splice(-6), 
+      play_order: index 
     }));
 
-    // 5. Bulk update the database
     await supabase.from('players').upsert(playersUpdates);
     await supabase.from('lobbies').update({ status: 'playing', board_state: initialBoardState }).eq('id', lobbyInfo!.id);
     
@@ -164,9 +157,12 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-slate-900 flex items-center justify-center p-4 text-white font-sans">
-      <div className="max-w-md w-full bg-slate-800 rounded-xl shadow-2xl p-8">
+      {/* Container expands if the game has started to fit the board */}
+      <div className={`w-full bg-slate-800 rounded-xl shadow-2xl p-8 transition-all ${lobbyInfo?.status === 'playing' ? 'max-w-5xl' : 'max-w-md'}`}>
+        
         <h1 className="text-3xl font-bold text-center mb-8 tracking-wider text-amber-400">ACQUIRE SYNDICATE</h1>
 
+        {/* --- LOBBY & WAITING ROOM VIEWS (unchanged) --- */}
         {view === 'home' && !lobbyInfo && (
           <div className="flex flex-col gap-4">
             <button onClick={() => { setView('create'); setErrorMessage(''); }} className="w-full bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold py-3 px-4 rounded transition-colors">CREATE A LOBBY</button>
@@ -174,7 +170,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* Create Form */}
         {view === 'create' && !lobbyInfo && (
           <form onSubmit={handleCreateLobby} className="flex flex-col gap-4">
             <div>
@@ -187,7 +182,6 @@ export default function Home() {
           </form>
         )}
 
-        {/* Join Form */}
         {view === 'join' && !lobbyInfo && (
           <form onSubmit={handleJoinLobby} className="flex flex-col gap-4">
             <div>
@@ -204,7 +198,6 @@ export default function Home() {
           </form>
         )}
 
-        {/* Live Waiting Room */}
         {lobbyInfo && lobbyInfo.status === 'waiting' && (
           <div className="space-y-6">
             <div className="bg-slate-700 p-6 rounded-lg border border-slate-600 text-center">
@@ -235,31 +228,73 @@ export default function Home() {
           </div>
         )}
 
-        {/* Temporary Game View to prove initialization worked */}
+        {/* --- NEW: LIVE BOARD VIEW --- */}
         {lobbyInfo && lobbyInfo.status === 'playing' && (
-          <div className="space-y-6">
-            <div className="text-center">
-              <h2 className="text-2xl font-bold text-white mb-2">GAME STARTED</h2>
-              <p className="text-amber-400 text-sm mb-6">Initial board setup complete!</p>
-            </div>
+          <div className="flex flex-col lg:flex-row gap-8">
             
-            <div className="space-y-3">
-              <h3 className="font-bold text-slate-300 border-b border-slate-700 pb-2">Turn Order (Closest to 1A goes first):</h3>
-              {[...players].sort((a, b) => (a.play_order || 0) - (b.play_order || 0)).map((p, idx) => (
-                <div key={p.id} className="bg-slate-700 p-3 rounded text-sm">
-                  <div className="flex justify-between mb-1">
-                    <span className="font-bold text-white">{idx + 1}. {p.player_name}</span>
-                    <span className="text-amber-400">${p.money}</span>
-                  </div>
-                  <div className="text-slate-400">
-                    Drawn Tile: <span className="text-white font-mono">{p.starting_tile}</span>
-                  </div>
-                  <div className="text-slate-400">
-                    Hand: <span className="text-white font-mono">{p.hand?.join(', ')}</span>
-                  </div>
+            {/* Left Side: Game Board Grid */}
+            <div className="flex-grow bg-slate-900 p-4 rounded-xl border border-slate-700 overflow-x-auto">
+              <div className="min-w-max">
+                <div className="grid grid-cols-12 gap-1 sm:gap-2">
+                  {BOARD_ROWS.map((row) => (
+                    BOARD_COLS.map((col) => {
+                      const tileId = `${col}${row}`;
+                      const isPlaced = lobbyInfo.board_state?.includes(tileId);
+                      
+                      return (
+                        <div 
+                          key={tileId} 
+                          className={`
+                            w-8 h-8 sm:w-12 sm:h-12 flex items-center justify-center rounded text-xs sm:text-sm font-bold border-2 transition-colors
+                            ${isPlaced 
+                              ? 'bg-amber-500 text-slate-900 border-amber-600 shadow-md' 
+                              : 'bg-slate-800 text-slate-500 border-slate-700'}
+                          `}
+                        >
+                          {tileId}
+                        </div>
+                      );
+                    })
+                  ))}
                 </div>
-              ))}
+              </div>
             </div>
+
+            {/* Right Side: Player Data */}
+            <div className="w-full lg:w-72 space-y-4">
+              <h3 className="font-bold text-slate-300 border-b border-slate-700 pb-2">
+                Turn Order
+              </h3>
+              
+              <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
+                {[...players].sort((a, b) => (a.play_order || 0) - (b.play_order || 0)).map((p, idx) => (
+                  <div key={p.id} className="bg-slate-700 p-3 rounded-lg border border-slate-600 shadow-sm">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="font-bold text-white text-sm">
+                        {idx + 1}. {p.player_name}
+                      </span>
+                      <span className="text-amber-400 font-mono text-sm">${p.money}</span>
+                    </div>
+                    
+                    <div className="text-xs text-slate-400 mb-1">
+                      Start Tile: <span className="text-white font-mono bg-slate-800 px-1 rounded">{p.starting_tile}</span>
+                    </div>
+                    
+                    <div className="text-xs text-slate-400">
+                      Hand:
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {p.hand?.map(tile => (
+                          <span key={tile} className="bg-slate-800 text-white font-mono px-1.5 py-0.5 rounded border border-slate-600">
+                            {tile}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
           </div>
         )}
 
