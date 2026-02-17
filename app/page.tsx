@@ -152,7 +152,6 @@ export default function Home() {
         const splitMinority = minority / seconds.length;
         for (let p of seconds) await supabase.from('players').update({ money: p.money + splitMinority }).eq('id', p.id);
       } else { 
-        // Minority goes to Majority if only one player has stocks
         await supabase.from('players').update({ money: firsts[0].money + majority + minority }).eq('id', firsts[0].id); 
       }
     }
@@ -219,14 +218,24 @@ export default function Home() {
     }).eq('id', lobbyInfo.id);
   };
 
+  // --- RECTIFIED BUY LOGIC ---
   const handleBuyStock = async (corp: string) => {
     if (!lobbyInfo || !me) return;
-    const price = getStockPrice(corp, lobbyInfo.chain_sizes[corp] || 0);
-    if (me.money < price || stocksBoughtThisTurn >= 3 || (lobbyInfo.available_stocks[corp] || 0) <= 0) return;
+    
+    const size = lobbyInfo.chain_sizes[corp] || 0;
+    const price = getStockPrice(corp, size);
+    const available = lobbyInfo.available_stocks[corp] || 0;
+    
+    if (me.money < price || stocksBoughtThisTurn >= 3 || available <= 0) return;
+    
     const updatedStocks = { ...(me.stocks || {}), [corp]: ((me.stocks || {})[corp] || 0) + 1 };
+    
+    // UI Local State Update
     setStocksBoughtThisTurn(prev => prev + 1);
+
+    // Database Sync
     await supabase.from('players').update({ money: me.money - price, stocks: updatedStocks }).eq('id', me.id);
-    await supabase.from('lobbies').update({ available_stocks: { ...lobbyInfo.available_stocks, [corp]: (lobbyInfo.available_stocks[corp] || 0) - 1 } }).eq('id', lobbyInfo.id);
+    await supabase.from('lobbies').update({ available_stocks: { ...lobbyInfo.available_stocks, [corp]: available - 1 } }).eq('id', lobbyInfo.id);
   };
 
   const handleDisposition = async (action: 'sell' | 'trade' | 'keep') => {
@@ -242,14 +251,12 @@ export default function Home() {
     const nextIdx = (lobbyInfo.disposition_turn_index + 1) % activePlayers.length;
     
     if (nextIdx === lobbyInfo.current_turn_index) {
-        // Current defunct processing finished for all players
         const updatedOwnership = { ...lobbyInfo.tile_ownership };
         Object.keys(updatedOwnership).forEach(k => { if (updatedOwnership[k] === current_defunct) updatedOwnership[k] = survivor!; });
         
         const remainingDefuncts = defunct_corps?.filter(c => c !== current_defunct) || [];
         
         if (remainingDefuncts.length > 0) {
-            // Move to next defunct in the merger
             await distributeBonuses(remainingDefuncts[0], lobbyInfo.chain_sizes[remainingDefuncts[0]]);
             await supabase.from('lobbies').update({ 
                 merger_data: { ...lobbyInfo.merger_data, current_defunct: remainingDefuncts[0], defunct_corps: remainingDefuncts },
@@ -259,7 +266,6 @@ export default function Home() {
                 chain_sizes: { ...lobbyInfo.chain_sizes, [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) }
             }).eq('id', lobbyInfo.id);
         } else {
-            // Merger complete
             updatedOwnership[tile_placed!] = survivor!;
             await supabase.from('lobbies').update({ 
                 turn_phase: 'buy_stocks', 
@@ -278,7 +284,10 @@ export default function Home() {
     const pool = [...lobbyInfo.tile_pool];
     const hand = [...me.hand];
     if (pool.length > 0) hand.push(pool.pop()!);
+    
+    // RESET PURCHASE COUNTER
     setStocksBoughtThisTurn(0);
+    
     const activePlayers = players.filter(p => !p.is_spectator);
     await supabase.from('players').update({ hand }).eq('id', me.id);
     await supabase.from('lobbies').update({ 
@@ -290,11 +299,9 @@ export default function Home() {
 
   const handleEndGame = async () => {
     if (!lobbyInfo) return;
-    // AWARD FINAL BONUSES FOR ALL ACTIVE CHAINS
     for (const corp of lobbyInfo.active_chains) {
       await distributeBonuses(corp, lobbyInfo.chain_sizes[corp]);
     }
-    // FETCH REFRESHED PLAYER DATA FOR FINAL LIQUIDATION
     const { data: finalP } = await supabase.from('players').select('*').eq('lobby_id', lobbyInfo.id);
     if (!finalP) return;
 
@@ -346,7 +353,6 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase">
-      {/* HEADER */}
       <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center z-50 sticky top-0">
         <div className="flex items-center gap-4">
           <h1 className="text-xl font-black text-amber-500 italic">Acquire Syndicate</h1>
@@ -405,7 +411,6 @@ export default function Home() {
         ) : (
            <div className="max-w-7xl mx-auto h-full grid grid-cols-1 lg:grid-cols-12 gap-0 lg:gap-6 lg:p-6">
               <div className={`lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-3xl border border-slate-800 overflow-auto flex flex-col relative ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'}`}>
-                {/* MODALS */}
                 {lobbyInfo.turn_phase === 'found_chain' && me?.play_order === lobbyInfo.current_turn_index && (
                   <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm z-40 flex items-center justify-center p-4">
                     <div className="bg-slate-900 p-8 rounded-3xl border border-amber-500 shadow-2xl text-center">
@@ -451,7 +456,6 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* SIDEBAR */}
               <div className={`lg:col-span-4 flex flex-col gap-4 overflow-y-auto pb-24 lg:pb-0 ${mobileTab !== 'market' ? 'hidden lg:flex' : 'flex'}`}>
                  <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800">
                     <h3 className="text-[9px] font-black text-slate-500 mb-3 uppercase tracking-widest">Draw Ceremony</h3>
@@ -490,13 +494,16 @@ export default function Home() {
                               <span>{c} ({size})</span>
                               <div className="flex items-center gap-3">
                                 <span className="text-emerald-400 font-mono">${price}</span>
-                                <button onClick={() => handleBuyStock(c)} disabled={!active || lobbyInfo.current_turn_index !== me?.play_order || stocksBoughtThisTurn >= 3 || (me?.money || 0) < price} className="bg-amber-500 text-black px-2 py-1 rounded text-[9px] disabled:opacity-0 uppercase tracking-widest">Buy</button>
+                                <button onClick={() => handleBuyStock(c)} disabled={!active || lobbyInfo.current_turn_index !== me?.play_order || stocksBoughtThisTurn >= 3 || (me?.money || 0) < price || (lobbyInfo.available_stocks[c] || 0) <= 0} className="bg-amber-500 text-black px-2 py-1 rounded text-[9px] disabled:opacity-0 uppercase tracking-widest">Buy</button>
                               </div>
                             </div>
                           );
                        })}
                        {lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks' && (
-                          <button onClick={handleEndTurn} className="w-full bg-emerald-600 py-4 rounded-2xl font-black text-[10px] mt-4 uppercase tracking-widest shadow-lg">Commit & End Turn</button>
+                          <button onClick={handleEndTurn} className="w-full bg-emerald-600 py-4 rounded-2xl font-black text-[10px] mt-4 uppercase tracking-widest shadow-lg flex justify-center items-center gap-2">
+                            <span>Commit & End Turn</span>
+                            <span className="bg-black/20 px-2 py-0.5 rounded-md text-[8px]">({stocksBoughtThisTurn}/3)</span>
+                          </button>
                        )}
                     </div>
                  </div>
