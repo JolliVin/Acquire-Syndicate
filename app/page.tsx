@@ -119,9 +119,7 @@ export default function Home() {
         console.log("New Agent Detected on the Wire...");
         fetchData();
       })
-      .subscribe((status) => {
-        console.log("Syndicate Sync Status:", status);
-      });
+      .subscribe();
 
     return () => { supabase.removeChannel(channel); };
   }, [lobbyInfo?.id]);
@@ -328,12 +326,10 @@ export default function Home() {
     if (l) { await supabase.from('players').insert([{ lobby_id: l.id, player_name: playerName, is_host: true, money: 6000, stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), hand: [] }]); setLobbyInfo(l as Lobby); setIsHost(true); }
   };
 
-  // --- RECTIFIED JOIN LOGIC ---
   const handleJoinLobby = async (e: any) => {
     e.preventDefault(); 
     if (!playerName || !joinCodeInput) return;
 
-    // 1. Find the Lobby
     const { data: l } = await supabase
       .from('lobbies')
       .select('*')
@@ -341,13 +337,11 @@ export default function Home() {
       .single();
 
     if (l) {
-      // 2. Check current count to handle spectator mode automatically
       const { count } = await supabase
         .from('players')
         .select('*', { count: 'exact', head: true })
         .eq('lobby_id', l.id);
 
-      // 3. Infiltrate the Player Table
       const { error } = await supabase.from('players').insert([{ 
         lobby_id: l.id, 
         player_name: playerName, 
@@ -368,18 +362,66 @@ export default function Home() {
     }
   };
 
+  // --- RENEGADE START VALIDATION ---
   const handleStartGame = async () => {
     if (!lobbyInfo) return;
     const active = players.filter(p => !p.is_spectator);
     let pool: string[] = [];
     for (let r of BOARD_ROWS) for (let c of BOARD_COLS) pool.push(`${c}${r}`);
-    pool = pool.sort(() => Math.random() - 0.5);
-    const drawResults = active.map(p => ({ id: p.id, tile: pool.pop()! }));
-    drawResults.sort((a, b) => getTileValue(a.tile) - getTileValue(b.tile));
-    for (let i = 0; i < drawResults.length; i++) {
-      await supabase.from('players').update({ play_order: i, starting_tile: drawResults[i].tile, hand: pool.splice(-6) }).eq('id', drawResults[i].id);
+
+    let drawResults: { id: string, tile: string }[] = [];
+    let isValidStart = false;
+
+    while (!isValidStart) {
+      pool = pool.sort(() => Math.random() - 0.5);
+      const tempPool = [...pool];
+      drawResults = active.map(p => ({ id: p.id, tile: tempPool.pop()! }));
+
+      let hasAdjacency = false;
+      for (let i = 0; i < drawResults.length; i++) {
+        const t1 = drawResults[i].tile;
+        const col1 = parseInt(t1.match(/\d+/)?.[0] || '0');
+        const row1 = t1.match(/[A-I]/)?.[0] || 'A';
+
+        for (let j = i + 1; j < drawResults.length; j++) {
+          const t2 = drawResults[j].tile;
+          const col2 = parseInt(t2.match(/\d+/)?.[0] || '0');
+          const row2 = t2.match(/[A-I]/)?.[0] || 'A';
+
+          const isAdj = (col1 === col2 && Math.abs(row1.charCodeAt(0) - row2.charCodeAt(0)) === 1) ||
+                        (row1 === row2 && Math.abs(col1 - col2) === 1);
+          
+          if (isAdj) {
+            hasAdjacency = true;
+            break;
+          }
+        }
+        if (hasAdjacency) break;
+      }
+
+      if (!hasAdjacency) {
+        isValidStart = true;
+        pool = tempPool; 
+      } else {
+        console.log("Adjacency detected in Draw Ceremony. Reshuffling Syndicate assets...");
+      }
     }
-    await supabase.from('lobbies').update({ status: 'playing', board_state: drawResults.map(r => r.tile), tile_pool: pool }).eq('id', lobbyInfo.id);
+
+    drawResults.sort((a, b) => getTileValue(a.tile) - getTileValue(b.tile));
+
+    for (let i = 0; i < drawResults.length; i++) {
+      await supabase.from('players').update({ 
+        play_order: i, 
+        starting_tile: drawResults[i].tile, 
+        hand: pool.splice(-6) 
+      }).eq('id', drawResults[i].id);
+    }
+
+    await supabase.from('lobbies').update({ 
+      status: 'playing', 
+      board_state: drawResults.map(r => r.tile), 
+      tile_pool: pool 
+    }).eq('id', lobbyInfo.id);
   };
 
   const netWorth = me ? (me.money + CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, lobbyInfo?.chain_sizes[c] || 0)), 0)) : 0;
