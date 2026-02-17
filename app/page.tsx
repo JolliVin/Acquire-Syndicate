@@ -118,19 +118,32 @@ export default function Home() {
     if (!playerName.trim()) return;
 
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    
+    // 1. Create the Lobby Entry with full initialization
     const { data: l, error: lErr } = await supabase
       .from('lobbies')
       .insert([{ 
         join_code: code, 
         status: 'waiting', 
+        turn_phase: 'place_tile',
+        current_turn_index: 0,
+        board_state: [],
+        active_chains: [],
+        chain_sizes: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
+        tile_ownership: {},
+        available_stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 25 }), {}),
         merger_data: {}, 
-        available_stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 25 }), {}) 
+        tile_pool: []
       }])
       .select()
       .single();
 
-    if (lErr || !l) return alert("Failed to establish lobby.");
+    if (lErr || !l) {
+      console.error("Lobby Creation Error:", lErr);
+      return alert(`Establishment Failed: ${lErr?.message}`);
+    }
 
+    // 2. Add the Host to the Players table
     const { error: pErr } = await supabase
       .from('players')
       .insert([{ 
@@ -143,7 +156,10 @@ export default function Home() {
         stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}) 
       }]);
 
-    if (pErr) return alert("Failed to join as host.");
+    if (pErr) {
+      console.error("Player Join Error:", pErr);
+      return alert(`Host Assignment Failed: ${pErr.message}`);
+    }
 
     setLobbyInfo(l as Lobby);
     setIsHost(true);
@@ -153,34 +169,21 @@ export default function Home() {
     e.preventDefault();
     if (!playerName.trim() || !joinCodeInput.trim()) return;
 
-    const { data: l, error: lErr } = await supabase
-      .from('lobbies')
-      .select('*')
-      .eq('join_code', joinCodeInput.toUpperCase())
-      .single();
-
+    const { data: l, error: lErr } = await supabase.from('lobbies').select('*').eq('join_code', joinCodeInput.toUpperCase()).single();
     if (lErr || !l) return alert("Syndicate not found.");
 
     const { count } = await supabase.from('players').select('*', { count: 'exact', head: true }).eq('lobby_id', l.id);
     const isSpec = (count || 0) >= 6;
 
-    const { error: pErr } = await supabase
-      .from('players')
-      .insert([{ 
-        lobby_id: l.id, 
-        player_name: playerName, 
-        is_host: false, 
-        is_spectator: isSpec, 
-        money: 6000, 
-        hand: [], 
-        stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}) 
-      }]);
+    const { error: pErr } = await supabase.from('players').insert([{ 
+        lobby_id: l.id, player_name: playerName, is_host: false, is_spectator: isSpec, money: 6000, hand: [], stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}) 
+    }]);
 
     if (pErr) return alert("Infiltration failed.");
     setLobbyInfo(l as Lobby);
   };
 
-  // --- VOICE (PeerJS) ---
+  // --- VOICE ---
   const me = players.find(p => p.player_name === playerName);
   useEffect(() => {
     if (!me?.id || typeof window === 'undefined') return;
@@ -226,7 +229,7 @@ export default function Home() {
       const tiles = draws.map(d => d.d);
       if (!tiles.some(t => getNeighbors(t).some(n => tiles.includes(n)))) {
         draws.sort((a,b) => getTileValue(a.d) - getTileValue(b.d));
-        updates = draws.map((p, i) => ({ id: p.id, lobby_id: lobbyInfo.id, player_name: p.player_name, money: 6000, stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), starting_tile: p.d, hand: pool.splice(-6), play_order: i }));
+        updates = draws.map((p, i) => ({ id: p.id, lobby_id: lobbyInfo.id, player_name: p.player_name, money: 6000, stocks: CORPORATIONS.reduce((acc,c)=>({...acc,[c]:0}),{}), starting_tile: p.d, hand: pool.splice(-6), play_order: i }));
         valid = true;
       }
     }
@@ -241,6 +244,7 @@ export default function Home() {
     const adj = getNeighbors(tile).filter(n => lobbyInfo.board_state.includes(n));
     const corps = Array.from(new Set(adj.map(n => lobbyInfo.tile_ownership[n]).filter((c): c is string => !!c)));
     if (corps.filter(c => lobbyInfo.chain_sizes[c] >= 11).length > 1) return alert("Illegal Merger!");
+    
     let next = 'buy_stocks'; let mergerData: MergerData = {};
     if (corps.length > 1) {
       next = 'merger_resolution';
@@ -254,6 +258,32 @@ export default function Home() {
     }
     await supabase.from('players').update({ hand: cur.hand.filter(t => t !== tile) }).eq('id', cur.id);
     await supabase.from('lobbies').update({ board_state: [...lobbyInfo.board_state, tile], turn_phase: next, merger_data: mergerData, disposition_turn_index: lobbyInfo.current_turn_index }).eq('id', lobbyInfo.id);
+  };
+
+  const handleDisposition = async (action: 'sell' | 'trade' | 'keep') => {
+    const cur = players.find(p => p.play_order === lobbyInfo!.disposition_turn_index);
+    const defunct = lobbyInfo!.merger_data.current_defunct!;
+    const survivor = lobbyInfo!.merger_data.survivor!;
+    const count = cur!.stocks[defunct] || 0; let m = cur!.money; let s = { ...cur!.stocks };
+    if (action === 'sell') { m += count * getStockPrice(defunct, lobbyInfo!.chain_sizes[defunct]); s[defunct] = 0; }
+    else if (action === 'trade') { const pairs = Math.floor(count/2); s[defunct] -= pairs*2; s[survivor] = (s[survivor] || 0) + pairs; }
+    const nextIdx = (lobbyInfo!.disposition_turn_index! + 1) % players.filter(p=>!p.is_spectator).length;
+    if (nextIdx === lobbyInfo!.current_turn_index) {
+      const ownership = { ...lobbyInfo!.tile_ownership };
+      Object.keys(ownership).forEach(t => { if (ownership[t] === defunct || t === lobbyInfo!.merger_data.tile_placed) ownership[t] = survivor; });
+      await supabase.from('lobbies').update({ tile_ownership: ownership, turn_phase: 'buy_stocks', active_chains: lobbyInfo!.active_chains.filter(c => c !== defunct) }).eq('id', lobbyInfo!.id);
+    }
+    await supabase.from('players').update({ money: m, stocks: s }).eq('id', cur!.id);
+    await supabase.from('lobbies').update({ disposition_turn_index: nextIdx }).eq('id', lobbyInfo!.id);
+  };
+
+  const handleFoundChain = async (corp: string) => {
+    const cur = players.find(p => p.play_order === lobbyInfo?.current_turn_index);
+    const last = lobbyInfo!.board_state[lobbyInfo!.board_state.length - 1];
+    const tiles = [last, ...getNeighbors(last).filter(n => lobbyInfo!.board_state.includes(n) && !lobbyInfo!.tile_ownership[n])];
+    const ownership = { ...lobbyInfo!.tile_ownership }; tiles.forEach(t => ownership[t] = corp);
+    await supabase.from('players').update({ money: cur!.money, stocks: { ...cur!.stocks, [corp]: (cur!.stocks[corp] || 0) + 1 }}).eq('id', cur!.id);
+    await supabase.from('lobbies').update({ tile_ownership: ownership, active_chains: [...lobbyInfo!.active_chains, corp], chain_sizes: { ...lobbyInfo!.chain_sizes, [corp]: tiles.length }, turn_phase: 'buy_stocks', available_stocks: { ...lobbyInfo!.available_stocks, [corp]: lobbyInfo!.available_stocks[corp] - 1 }}).eq('id', lobbyInfo!.id);
   };
 
   const handleBuyStock = async (corp: string) => {
@@ -280,7 +310,7 @@ export default function Home() {
     setChatInput('');
   };
 
-  // --- PORTFOLIO CALC ---
+  // --- PORTFOLIO ---
   const myStocks = me?.stocks || {};
   const totalStockValue = CORPORATIONS.reduce((acc, corp) => {
     const count = myStocks[corp] || 0;
@@ -347,6 +377,31 @@ export default function Home() {
             <>
               {/* BOARD VIEW */}
               <div className={`lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-3xl border border-slate-800 overflow-auto ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'} flex-col relative`}>
+                {lobbyInfo.turn_phase === 'found_chain' && players.find(p => p.play_order === lobbyInfo.current_turn_index)?.player_name === playerName && (
+                    <div className="absolute inset-0 z-30 bg-slate-950/90 flex items-center justify-center p-6 backdrop-blur-sm">
+                        <div className="text-center bg-slate-900 p-8 rounded-3xl border border-amber-500 shadow-2xl">
+                            <h2 className="text-xl font-black text-amber-400 mb-6 uppercase tracking-widest">Found Corporation</h2>
+                            <div className="grid grid-cols-2 gap-2">
+                                {CORPORATIONS.filter(c => !lobbyInfo.active_chains.includes(c)).map(corp => (
+                                    <button key={corp} onClick={() => handleFoundChain(corp)} className={`${CORP_METADATA[corp].bg} ${CORP_METADATA[corp].text} p-4 rounded-xl font-black text-xs uppercase`}>{corp}</button>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                )}
+                {lobbyInfo.turn_phase === 'merger_resolution' && !lobbyInfo.merger_data.is_tied && players.find(p => p.play_order === lobbyInfo.disposition_turn_index)?.player_name === playerName && (
+                    <div className="absolute inset-0 z-30 bg-slate-950/90 flex items-center justify-center p-6 backdrop-blur-sm">
+                        <div className="bg-slate-900 border-2 border-emerald-500 p-8 rounded-3xl text-center max-w-sm w-full">
+                            <h2 className="text-xl font-black text-emerald-400 mb-2 uppercase">Stock Disposition</h2>
+                            <p className="text-[10px] text-slate-500 mb-6 uppercase tracking-widest">{lobbyInfo.merger_data.current_defunct} → {lobbyInfo.merger_data.survivor}</p>
+                            <div className="flex flex-col gap-3">
+                                <button onClick={() => handleDisposition('sell')} className="bg-white text-black font-black py-4 rounded-xl">SELL ALL</button>
+                                <button onClick={() => handleDisposition('trade')} className="bg-amber-600 text-white font-black py-4 rounded-xl">TRADE 2:1</button>
+                                <button onClick={() => handleDisposition('keep')} className="bg-slate-800 text-white font-bold py-3 rounded-xl border border-slate-700">KEEP ALL</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
                 <div className="min-w-[580px] grid grid-cols-12 gap-1 sm:gap-2">
                   {BOARD_ROWS.map(r => BOARD_COLS.map(c => {
                     const id = `${c}${r}`;
@@ -371,14 +426,6 @@ export default function Home() {
                           <p className="text-sm font-bold font-mono text-slate-100">${me?.money.toLocaleString()}</p>
                        </div>
                     </div>
-                    <div className="mt-4 flex flex-wrap gap-2">
-                       {CORPORATIONS.map(corp => myStocks[corp] > 0 && (
-                          <div key={corp} className={`px-2 py-1 rounded-md text-[9px] font-bold border flex gap-2 items-center ${CORP_METADATA[corp].bg} ${CORP_METADATA[corp].text} border-white/20`}>
-                             <span>{corp}</span>
-                             <span>{myStocks[corp]} Shares</span>
-                          </div>
-                       ))}
-                    </div>
                  </div>
 
                  <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 shadow-xl flex-grow">
@@ -392,9 +439,9 @@ export default function Home() {
                              const isTurn = lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks';
                              return (
                                 <tr key={corp} className={`border-b border-slate-800/50 last:border-0 ${isSoldOut ? 'opacity-40 grayscale' : ''}`}>
-                                   <td className="py-3 flex items-center gap-2">
+                                   <td className="py-3 flex items-center gap-2 font-bold">
                                       <div className={`w-2 h-2 rounded-full ${CORP_METADATA[corp].bg}`}></div>
-                                      <span className={`font-bold ${isSoldOut ? 'line-through text-slate-500' : ''}`}>{corp}</span>
+                                      <span className={isSoldOut ? 'line-through text-slate-500' : ''}>{corp}</span>
                                    </td>
                                    <td className="py-3 font-mono text-emerald-400 font-bold">${price}</td>
                                    <td className="py-3 text-right">
@@ -415,7 +462,6 @@ export default function Home() {
                  </div>
 
                  <div className="bg-slate-900 rounded-3xl border border-slate-800 flex flex-col h-[250px] shadow-xl overflow-hidden">
-                    <div className="p-3 border-b border-slate-800 text-[9px] font-black uppercase tracking-widest text-slate-500">Secure Comms</div>
                     <div className="flex-grow overflow-y-auto p-4 space-y-3">
                         {messages.map((m, i) => (
                             <div key={i} className={`flex flex-col ${m.player_name === playerName ? 'items-end' : 'items-start'}`}>
@@ -435,14 +481,6 @@ export default function Home() {
           )}
         </div>
       </div>
-
-      {lobbyInfo && lobbyInfo.status === 'playing' && (
-        <nav className="lg:hidden h-20 bg-slate-900 border-t border-slate-800 grid grid-cols-3 items-center z-50 fixed bottom-0 left-0 right-0">
-          <button onClick={() => setMobileTab('board')} className={`flex flex-col items-center gap-1 ${mobileTab === 'board' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">◫</span><span className="text-[9px] font-black uppercase tracking-widest">Grid</span></button>
-          <button onClick={() => setMobileTab('market')} className={`flex flex-col items-center gap-1 ${mobileTab === 'market' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">＄</span><span className="text-[9px] font-black uppercase tracking-widest">Market</span></button>
-          <button onClick={() => setMobileTab('chat')} className={`flex flex-col items-center gap-1 ${mobileTab === 'chat' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">💬</span><span className="text-[9px] font-black uppercase tracking-widest">Comms</span></button>
-        </nav>
-      )}
     </main>
   );
 }
