@@ -25,6 +25,7 @@ type Lobby = {
   turn_phase?: string;
   available_stocks?: Record<string, number>;
   active_chains?: string[];
+  chain_sizes?: Record<string, number>;
 };
 
 export default function Home() {
@@ -41,12 +42,38 @@ export default function Home() {
   const [isStarting, setIsStarting] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
 
-  // NEW: Track how many stocks the current player bought this turn
   const [stocksBoughtThisTurn, setStocksBoughtThisTurn] = useState(0);
 
   const CORPORATIONS = ['Sackson', 'Festival', 'Tower', 'American', 'Worldwide', 'Imperial', 'Continental'];
   const BOARD_ROWS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
   const BOARD_COLS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+  // --- CORRECTED: Official RGS Pricing Engine ---
+  const getStockPrice = (corp: string, size: number) => {
+    // Minimum theoretical size for an active chain is 2
+    const effectiveSize = size < 2 ? 2 : size; 
+
+    let basePrice = 0;
+    // Low Tier
+    if (['Sackson', 'Tower'].includes(corp)) basePrice = 200;
+    // Medium Tier
+    else if (['Festival', 'Worldwide', 'American'].includes(corp)) basePrice = 300;
+    // High Tier
+    else if (['Imperial', 'Continental'].includes(corp)) basePrice = 400;
+
+    // RGS Official Tier Step Math
+    let tierBonus = 0;
+    if (effectiveSize === 3) tierBonus = 100;
+    else if (effectiveSize === 4) tierBonus = 200;
+    else if (effectiveSize === 5) tierBonus = 300;
+    else if (effectiveSize >= 6 && effectiveSize <= 10) tierBonus = 400;
+    else if (effectiveSize >= 11 && effectiveSize <= 20) tierBonus = 500;
+    else if (effectiveSize >= 21 && effectiveSize <= 30) tierBonus = 600;
+    else if (effectiveSize >= 31 && effectiveSize <= 40) tierBonus = 700;
+    else if (effectiveSize >= 41) tierBonus = 800;
+
+    return basePrice + tierBonus;
+  };
 
   const getTileValue = (tile: string) => {
     const number = parseInt(tile.match(/\d+/)?.[0] || '0');
@@ -144,9 +171,17 @@ export default function Home() {
     }));
 
     await supabase.from('players').upsert(playersUpdates);
+    
     await supabase.from('lobbies').update({ 
-      status: 'playing', board_state: initialBoardState, tile_pool: pool, current_turn_index: 0, turn_phase: 'place_tile'
+      status: 'playing', 
+      board_state: initialBoardState, 
+      tile_pool: pool, 
+      current_turn_index: 0, 
+      turn_phase: 'place_tile',
+      active_chains: [],
+      chain_sizes: { Sackson: 0, Festival: 0, Tower: 0, American: 0, Worldwide: 0, Imperial: 0, Continental: 0 }
     }).eq('id', lobbyInfo!.id);
+    
     setIsStarting(false);
   };
 
@@ -161,13 +196,12 @@ export default function Home() {
     await supabase.from('lobbies').update({ board_state: newBoardState, turn_phase: 'buy_stocks' }).eq('id', lobbyInfo.id);
   };
 
-  // NEW: Buy Stock Logic
   const handleBuyStock = async (corp: string) => {
     const currentPlayer = players.find(p => p.play_order === lobbyInfo?.current_turn_index);
     if (!lobbyInfo || currentPlayer?.player_name !== playerName || stocksBoughtThisTurn >= 3) return;
     
-    // Hardcoded price for now, to be replaced by dynamic pricing table
-    const price = 200; 
+    const currentSize = lobbyInfo.chain_sizes?.[corp] || 0;
+    const price = getStockPrice(corp, currentSize); 
     
     if ((currentPlayer.money || 0) < price) {
       alert("Not enough money!");
@@ -188,7 +222,6 @@ export default function Home() {
     await supabase.from('lobbies').update({ available_stocks: newLobbyStocks }).eq('id', lobbyInfo.id);
   };
 
-  // NEW: End Turn Logic
   const handleEndTurn = async () => {
     const currentPlayer = players.find(p => p.play_order === lobbyInfo?.current_turn_index);
     if (!lobbyInfo || currentPlayer?.player_name !== playerName) return;
@@ -198,7 +231,7 @@ export default function Home() {
     if (newPool.length > 0) newHand.push(newPool.pop()!);
 
     const nextTurnIndex = (lobbyInfo.current_turn_index! + 1) % players.length;
-    setStocksBoughtThisTurn(0); // Reset for the next time it's their turn
+    setStocksBoughtThisTurn(0); 
 
     await supabase.from('players').update({ hand: newHand }).eq('id', currentPlayer.id);
     await supabase.from('lobbies').update({ 
@@ -213,7 +246,6 @@ export default function Home() {
       <div className={`w-full bg-slate-800 rounded-xl shadow-2xl p-8 transition-all ${lobbyInfo?.status === 'playing' ? 'max-w-6xl' : 'max-w-md'}`}>
         <h1 className="text-3xl font-bold text-center mb-8 tracking-wider text-amber-400">ACQUIRE SYNDICATE</h1>
 
-        {/* Home & Waiting Views Omitted for Brevity (Same as before) */}
         {view === 'home' && !lobbyInfo && (
           <div className="flex flex-col gap-4">
             <button onClick={() => { setView('create'); setErrorMessage(''); }} className="w-full bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold py-3 px-4 rounded transition-colors">CREATE A LOBBY</button>
@@ -223,7 +255,7 @@ export default function Home() {
 
         {view === 'create' && !lobbyInfo && (
           <form onSubmit={handleCreateLobby} className="flex flex-col gap-4">
-            <div><label className="block text-sm font-medium mb-2 text-slate-300">Player Name</label><input type="text" maxLength={10} required value={playerName} onChange={(e) => setPlayerName(e.target.value)} className="w-full bg-slate-700 border border-slate-600 rounded px-4 py-2 text-white focus:outline-none focus:border-amber-500" placeholder="Enter name..."/></div>
+            <div><label className="block text-sm font-medium mb-2 text-slate-300">Player Name (Max 10 chars)</label><input type="text" maxLength={10} required value={playerName} onChange={(e) => setPlayerName(e.target.value)} className="w-full bg-slate-700 border border-slate-600 rounded px-4 py-2 text-white focus:outline-none focus:border-amber-500" placeholder="Enter name..."/></div>
             {errorMessage && <div className="bg-red-500/20 border border-red-500 text-red-300 px-4 py-2 rounded text-sm">{errorMessage}</div>}
             <button type="submit" disabled={isCreating} className="w-full bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold py-3 px-4 rounded">{isCreating ? 'CREATING...' : 'CREATE'}</button>
             <button type="button" onClick={() => { setView('home'); setErrorMessage(''); }} className="text-sm text-slate-400 hover:text-white mt-2">← Back</button>
@@ -232,7 +264,7 @@ export default function Home() {
 
         {view === 'join' && !lobbyInfo && (
           <form onSubmit={handleJoinLobby} className="flex flex-col gap-4">
-            <div><label className="block text-sm font-medium mb-2 text-slate-300">Player Name</label><input type="text" maxLength={10} required value={playerName} onChange={(e) => setPlayerName(e.target.value)} className="w-full bg-slate-700 border border-slate-600 rounded px-4 py-2 text-white focus:outline-none focus:border-amber-500" placeholder="Enter name..."/></div>
+            <div><label className="block text-sm font-medium mb-2 text-slate-300">Player Name (Max 10 chars)</label><input type="text" maxLength={10} required value={playerName} onChange={(e) => setPlayerName(e.target.value)} className="w-full bg-slate-700 border border-slate-600 rounded px-4 py-2 text-white focus:outline-none focus:border-amber-500" placeholder="Enter name..."/></div>
             <div><label className="block text-sm font-medium mb-2 text-slate-300">Join Code</label><input type="text" maxLength={6} required value={joinCodeInput} onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())} className="w-full bg-slate-700 border border-slate-600 rounded px-4 py-2 text-white font-mono uppercase focus:outline-none focus:border-amber-500" placeholder="XXXXXX"/></div>
             {errorMessage && <div className="bg-red-500/20 border border-red-500 text-red-300 px-4 py-2 rounded text-sm">{errorMessage}</div>}
             <button type="submit" disabled={isJoining} className="w-full border-2 border-amber-500 text-amber-500 hover:bg-slate-700 font-bold py-3 px-4 rounded">{isJoining ? 'JOINING...' : 'JOIN'}</button>
@@ -251,11 +283,9 @@ export default function Home() {
           </div>
         )}
 
-        {/* PLAYING VIEW */}
         {lobbyInfo && lobbyInfo.status === 'playing' && (
           <div className="flex flex-col lg:flex-row gap-8">
             
-            {/* Board */}
             <div className="flex-grow bg-slate-900 p-4 rounded-xl border border-slate-700 overflow-x-auto">
               <div className="min-w-max grid grid-cols-12 gap-1 sm:gap-2">
                 {BOARD_ROWS.map((row) => BOARD_COLS.map((col) => {
@@ -270,10 +300,8 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Sidebar Controls */}
             <div className="w-full lg:w-80 flex flex-col gap-4">
               
-              {/* Turn Controls Container */}
               <div className="bg-slate-700 p-4 rounded-lg border border-slate-600 shadow-sm">
                 <div className="flex justify-between items-center mb-4">
                   <h3 className="font-bold text-white">Current Action</h3>
@@ -281,7 +309,6 @@ export default function Home() {
                 </div>
 
                 {players.find(p => p.play_order === lobbyInfo.current_turn_index)?.player_name === playerName ? (
-                  // IT IS MY TURN
                   lobbyInfo.turn_phase === 'place_tile' ? (
                     <div className="text-center py-4">
                       <p className="text-amber-400 mb-2 font-medium">Select a tile to place</p>
@@ -291,17 +318,22 @@ export default function Home() {
                     <div className="space-y-4">
                       <p className="text-amber-400 font-medium text-center">Buy Stocks ({stocksBoughtThisTurn}/3)</p>
                       <div className="grid grid-cols-2 gap-2">
-                        {CORPORATIONS.map(corp => (
-                          <button 
-                            key={corp} 
-                            onClick={() => handleBuyStock(corp)}
-                            disabled={stocksBoughtThisTurn >= 3 || (lobbyInfo.available_stocks?.[corp] || 0) <= 0}
-                            className="text-xs bg-slate-800 border border-slate-600 hover:border-amber-400 text-white p-2 rounded flex flex-col items-center disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                          >
-                            <span className="font-bold">{corp}</span>
-                            <span className="text-slate-400">${200} | {lobbyInfo.available_stocks?.[corp] || 0} left</span>
-                          </button>
-                        ))}
+                        {CORPORATIONS.map(corp => {
+                          const currentSize = lobbyInfo.chain_sizes?.[corp] || 0;
+                          const price = getStockPrice(corp, currentSize);
+                          
+                          return (
+                            <button 
+                              key={corp} 
+                              onClick={() => handleBuyStock(corp)}
+                              disabled={stocksBoughtThisTurn >= 3 || (lobbyInfo.available_stocks?.[corp] || 0) <= 0}
+                              className="text-xs bg-slate-800 border border-slate-600 hover:border-amber-400 text-white p-2 rounded flex flex-col items-center disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                            >
+                              <span className="font-bold">{corp}</span>
+                              <span className="text-slate-400">${price} | {lobbyInfo.available_stocks?.[corp] || 0} left</span>
+                            </button>
+                          )
+                        })}
                       </div>
                       <button 
                         onClick={handleEndTurn}
@@ -312,14 +344,12 @@ export default function Home() {
                     </div>
                   )
                 ) : (
-                  // NOT MY TURN
                   <div className="text-center py-6 text-slate-400">
                     Waiting for <strong className="text-white">{players.find(p => p.play_order === lobbyInfo.current_turn_index)?.player_name}</strong> to play...
                   </div>
                 )}
               </div>
 
-              {/* Player List */}
               <div className="space-y-3 max-h-[400px] overflow-y-auto pr-2">
                 {[...players].sort((a, b) => (a.play_order || 0) - (b.play_order || 0)).map((p, idx) => {
                   const isCurrentTurn = lobbyInfo.current_turn_index === p.play_order;
@@ -334,7 +364,6 @@ export default function Home() {
                         <span className="text-emerald-400 font-mono text-sm">${p.money}</span>
                       </div>
                       
-                      {/* Portfolio Display */}
                       <div className="flex flex-wrap gap-1 mb-2">
                         {CORPORATIONS.map(corp => {
                           const count = p.stocks?.[corp] || 0;
