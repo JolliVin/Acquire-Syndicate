@@ -69,11 +69,17 @@ const getStockPrice = (corp: string, size: number) => {
   if (['Sackson', 'Tower'].includes(corp)) base = 200;
   else if (['Festival', 'Worldwide', 'American'].includes(corp)) base = 300;
   else if (['Imperial', 'Continental'].includes(corp)) base = 400;
+
   let bonus = 0;
-  if (s === 3) bonus = 100; else if (s === 4) bonus = 200; else if (s === 5) bonus = 300;
-  else if (s >= 6 && s <= 10) bonus = 400; else if (s >= 11 && s <= 20) bonus = 500;
-  else if (s >= 21 && s <= 30) bonus = 600; else if (s >= 31 && s <= 40) bonus = 700;
+  if (s === 3) bonus = 100;
+  else if (s === 4) bonus = 200;
+  else if (s === 5) bonus = 300;
+  else if (s >= 6 && s <= 10) bonus = 400;
+  else if (s >= 11 && s <= 20) bonus = 500;
+  else if (s >= 21 && s <= 30) bonus = 600;
+  else if (s >= 31 && s <= 40) bonus = 700;
   else if (s >= 41) bonus = 800;
+  
   return base + bonus;
 };
 
@@ -90,7 +96,7 @@ export default function Home() {
 
   const peerInstance = useRef<Peer | null>(null);
 
-  // --- HARDENED REALTIME SYNC ---
+  // --- REALTIME ENGINE ---
   useEffect(() => {
     if (!lobbyInfo) return;
 
@@ -115,10 +121,7 @@ export default function Home() {
 
     const channel = supabase.channel(`sync-${lobbyInfo.id}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'lobbies', filter: `id=eq.${lobbyInfo.id}` }, () => fetchData())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'players', filter: `lobby_id=eq.${lobbyInfo.id}` }, () => {
-        console.log("New Agent Detected on the Wire...");
-        fetchData();
-      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'players', filter: `lobby_id=eq.${lobbyInfo.id}` }, () => fetchData())
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
@@ -126,6 +129,7 @@ export default function Home() {
 
   const me = players.find(p => p.player_name === playerName);
 
+  // --- COMMS SYSTEM ---
   useEffect(() => {
     if (!me?.id || typeof window === 'undefined') return;
     const peer = new Peer(me.id.replace(/-/g, ''));
@@ -133,55 +137,88 @@ export default function Home() {
     peer.on('call', (call) => {
       navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
         call.answer(stream);
-        call.on('stream', (rms) => { const a = new Audio(); a.srcObject = rms; a.play(); });
+        call.on('stream', (rms) => { 
+          const a = new Audio(); 
+          a.srcObject = rms; 
+          a.play(); 
+        });
       });
     });
     return () => peer.destroy();
   }, [me?.id]);
 
   const toggleVoice = async () => {
-    if (isMicActive) { peerInstance.current?.destroy(); setIsMicActive(false); return; }
+    if (isMicActive) { 
+      peerInstance.current?.destroy(); 
+      setIsMicActive(false); 
+      return; 
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       setIsMicActive(true);
       players.filter(p => p.id !== me?.id).forEach(player => {
         const call = peerInstance.current?.call(player.id.replace(/-/g, ''), stream);
-        call?.on('stream', (rms) => { const a = new Audio(); a.srcObject = rms; a.play(); });
+        call?.on('stream', (rms) => { 
+          const a = new Audio(); 
+          a.srcObject = rms; 
+          a.play(); 
+        });
       });
-    } catch (err) { alert("Mic Access Denied."); }
+    } catch (err) { 
+      alert("Comms Access Denied."); 
+    }
   };
 
+  // --- MERGER ENGINE ---
   const distributeBonuses = async (corp: string, size: number) => {
     const price = getStockPrice(corp, size);
     const majority = price * 10;
     const minority = price * 5;
-    const ranked = [...players].filter(p => !p.is_spectator).sort((a, b) => (b.stocks[corp] || 0) - (a.stocks[corp] || 0));
+    
+    const ranked = [...players]
+      .filter(p => !p.is_spectator)
+      .sort((a, b) => (b.stocks[corp] || 0) - (a.stocks[corp] || 0));
+    
     const counts = ranked.map(p => p.stocks[corp] || 0);
     if (counts[0] === 0) return;
 
     const firsts = ranked.filter(p => (p.stocks[corp] || 0) === counts[0]);
+    
     if (firsts.length > 1) {
       const split = (majority + minority) / firsts.length;
-      for (let p of firsts) await supabase.from('players').update({ money: p.money + split }).eq('id', p.id);
+      for (const p of firsts) {
+        await supabase.from('players').update({ money: p.money + split }).eq('id', p.id);
+      }
     } else {
       await supabase.from('players').update({ money: firsts[0].money + majority }).eq('id', firsts[0].id);
-      const seconds = ranked.filter(p => (p.stocks[corp] || 0) === counts.find(c => c < counts[0] && c > 0));
+      const secondMax = counts.find(c => c < counts[0] && c > 0);
+      const seconds = ranked.filter(p => (p.stocks[corp] || 0) === secondMax);
+      
       if (seconds.length > 0) {
         const splitMinority = minority / seconds.length;
-        for (let p of seconds) await supabase.from('players').update({ money: p.money + splitMinority }).eq('id', p.id);
+        for (const p of seconds) {
+          await supabase.from('players').update({ money: p.money + splitMinority }).eq('id', p.id);
+        }
       } else { 
-        await supabase.from('players').update({ money: firsts[0].money + majority + minority }).eq('id', firsts[0].id); 
+        await supabase.from('players').update({ money: firsts[0].money + minority }).eq('id', firsts[0].id); 
       }
     }
   };
 
+  // --- CORE GAME ACTIONS ---
   const handlePlaceTile = async (tile: string) => {
     if (!lobbyInfo || !me) return;
     const col = parseInt(tile.match(/\d+/)?.[0] || '0');
     const row = tile.match(/[A-I]/)?.[0] || 'A';
-    const adj = [`${col-1}${row}`, `${col+1}${row}`, `${col}${String.fromCharCode(row.charCodeAt(0)-1)}`, `${col}${String.fromCharCode(row.charCodeAt(0)+1)}`].filter(n => lobbyInfo.board_state.includes(n));
-    const neighboringCorps = Array.from(new Set(adj.map(n => lobbyInfo.tile_ownership[n]).filter((c): c is string => !!c)));
+    
+    const adj = [
+      `${col-1}${row}`, `${col+1}${row}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0)-1)}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0)+1)}`
+    ].filter(n => lobbyInfo.board_state.includes(n));
 
+    const neighboringCorps = Array.from(new Set(adj.map(n => lobbyInfo.tile_ownership[n]).filter((c): c is string => !!c)));
+    
     let nextPhase = 'buy_stocks';
     let mData: MergerData = {};
 
@@ -190,6 +227,7 @@ export default function Home() {
       const sorted = [...neighboringCorps].sort((a,b) => (lobbyInfo.chain_sizes[b] || 0) - (lobbyInfo.chain_sizes[a] || 0));
       const survivor = sorted[0];
       const defuncts = sorted.slice(1);
+      
       await distributeBonuses(defuncts[0], lobbyInfo.chain_sizes[defuncts[0]]);
       mData = { survivor, current_defunct: defuncts[0], defunct_corps: defuncts, tile_placed: tile };
     } 
@@ -198,10 +236,10 @@ export default function Home() {
       const unincorporatedAdj = adj.filter(n => !lobbyInfo.tile_ownership[n]);
       const newOwnership = { ...lobbyInfo.tile_ownership, [tile]: survivor };
       unincorporatedAdj.forEach(t => { newOwnership[t] = survivor; });
-
+      
       await supabase.from('lobbies').update({ 
         chain_sizes: { ...lobbyInfo.chain_sizes, [survivor]: (lobbyInfo.chain_sizes[survivor] || 0) + 1 + unincorporatedAdj.length },
-        tile_ownership: newOwnership
+        tile_ownership: newOwnership 
       }).eq('id', lobbyInfo.id);
     }
     else if (neighboringCorps.length === 0 && adj.length > 0 && lobbyInfo.active_chains.length < 7) {
@@ -209,78 +247,111 @@ export default function Home() {
     }
 
     await supabase.from('players').update({ hand: me.hand.filter(t => t !== tile) }).eq('id', me.id);
-    await supabase.from('lobbies').update({ board_state: [...lobbyInfo.board_state, tile], turn_phase: nextPhase, merger_data: mData, disposition_turn_index: lobbyInfo.current_turn_index }).eq('id', lobbyInfo.id);
+    await supabase.from('lobbies').update({ 
+      board_state: [...lobbyInfo.board_state, tile], 
+      turn_phase: nextPhase, 
+      merger_data: mData, 
+      disposition_turn_index: lobbyInfo.current_turn_index 
+    }).eq('id', lobbyInfo.id);
   };
 
   const handleFoundChain = async (corp: string) => {
     if (!lobbyInfo || !me) return;
-    const currentStocks = me.stocks || {};
-    const updatedStocks = { ...currentStocks, [corp]: (currentStocks[corp] || 0) + 1 };
+    const updatedStocks = { ...(me.stocks || {}), [corp]: ((me.stocks || {})[corp] || 0) + 1 };
     const lastTile = lobbyInfo.board_state[lobbyInfo.board_state.length - 1];
     const col = parseInt(lastTile.match(/\d+/)?.[0] || '0');
     const row = lastTile.match(/[A-I]/)?.[0] || 'A';
-    const cluster = [`${col-1}${row}`, `${col+1}${row}`, `${col}${String.fromCharCode(row.charCodeAt(0)-1)}`, `${col}${String.fromCharCode(row.charCodeAt(0)+1)}`]
-      .filter(n => lobbyInfo.board_state.includes(n) && !lobbyInfo.tile_ownership[n]);
+    
+    const cluster = [
+      `${col-1}${row}`, `${col+1}${row}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0)-1)}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0)+1)}`
+    ].filter(n => lobbyInfo.board_state.includes(n) && !lobbyInfo.tile_ownership[n]);
     
     const newOwnership = { ...lobbyInfo.tile_ownership };
     [lastTile, ...cluster].forEach(t => { newOwnership[t] = corp; });
 
     await supabase.from('players').update({ stocks: updatedStocks }).eq('id', me.id);
     await supabase.from('lobbies').update({ 
-      active_chains: [...lobbyInfo.active_chains, corp],
-      chain_sizes: { ...lobbyInfo.chain_sizes, [corp]: cluster.length + 1 },
-      tile_ownership: newOwnership,
-      available_stocks: { ...lobbyInfo.available_stocks, [corp]: (lobbyInfo.available_stocks[corp] || 25) - 1 },
-      turn_phase: 'buy_stocks'
+      active_chains: [...lobbyInfo.active_chains, corp], 
+      chain_sizes: { ...lobbyInfo.chain_sizes, [corp]: cluster.length + 1 }, 
+      tile_ownership: newOwnership, 
+      available_stocks: { ...lobbyInfo.available_stocks, [corp]: (lobbyInfo.available_stocks[corp] || 25) - 1 }, 
+      turn_phase: 'buy_stocks' 
     }).eq('id', lobbyInfo.id);
   };
 
   const handleBuyStock = async (corp: string) => {
     if (!lobbyInfo || !me) return;
-    const size = lobbyInfo.chain_sizes[corp] || 0;
-    const price = getStockPrice(corp, size);
+    const price = getStockPrice(corp, lobbyInfo.chain_sizes[corp] || 0);
     const available = lobbyInfo.available_stocks[corp] || 0;
+    
     if (me.money < price || stocksBoughtThisTurn >= 3 || available <= 0) return;
+    
     const updatedStocks = { ...(me.stocks || {}), [corp]: ((me.stocks || {})[corp] || 0) + 1 };
     setStocksBoughtThisTurn(prev => prev + 1);
-    await supabase.from('players').update({ money: me.money - price, stocks: updatedStocks }).eq('id', me.id);
-    await supabase.from('lobbies').update({ available_stocks: { ...lobbyInfo.available_stocks, [corp]: available - 1 } }).eq('id', lobbyInfo.id);
+    
+    await supabase.from('players').update({ 
+      money: me.money - price, 
+      stocks: updatedStocks 
+    }).eq('id', me.id);
+    
+    await supabase.from('lobbies').update({ 
+      available_stocks: { ...lobbyInfo.available_stocks, [corp]: available - 1 } 
+    }).eq('id', lobbyInfo.id);
   };
 
   const handleDisposition = async (action: 'sell' | 'trade' | 'keep') => {
     if (!lobbyInfo || !me) return;
     const { survivor, current_defunct, defunct_corps, tile_placed } = lobbyInfo.merger_data;
     const count = me.stocks[current_defunct!] || 0;
-    let m = me.money; let s = { ...me.stocks };
+    let m = me.money;
+    let s = { ...me.stocks };
 
-    if (action === 'sell') { m += count * getStockPrice(current_defunct!, lobbyInfo.chain_sizes[current_defunct!]); s[current_defunct!] = 0; }
-    else if (action === 'trade') { const pairs = Math.floor(count/2); s[current_defunct!] -= pairs*2; s[survivor!] = (s[survivor!] || 0) + pairs; }
+    if (action === 'sell') {
+      m += count * getStockPrice(current_defunct!, lobbyInfo.chain_sizes[current_defunct!]);
+      s[current_defunct!] = 0;
+    } else if (action === 'trade') {
+      const pairs = Math.floor(count / 2);
+      s[current_defunct!] -= pairs * 2;
+      s[survivor!] = (s[survivor!] || 0) + pairs;
+    }
 
     const activePlayers = players.filter(p => !p.is_spectator);
     const nextIdx = (lobbyInfo.disposition_turn_index + 1) % activePlayers.length;
-    
+
     if (nextIdx === lobbyInfo.current_turn_index) {
-        const updatedOwnership = { ...lobbyInfo.tile_ownership };
-        Object.keys(updatedOwnership).forEach(k => { if (updatedOwnership[k] === current_defunct) updatedOwnership[k] = survivor!; });
-        const remainingDefuncts = defunct_corps?.filter(c => c !== current_defunct) || [];
-        if (remainingDefuncts.length > 0) {
-            await distributeBonuses(remainingDefuncts[0], lobbyInfo.chain_sizes[remainingDefuncts[0]]);
-            await supabase.from('lobbies').update({ 
-                merger_data: { ...lobbyInfo.merger_data, current_defunct: remainingDefuncts[0], defunct_corps: remainingDefuncts },
-                disposition_turn_index: lobbyInfo.current_turn_index,
-                tile_ownership: updatedOwnership,
-                active_chains: lobbyInfo.active_chains.filter(c => c !== current_defunct),
-                chain_sizes: { ...lobbyInfo.chain_sizes, [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) }
-            }).eq('id', lobbyInfo.id);
-        } else {
-            updatedOwnership[tile_placed!] = survivor!;
-            await supabase.from('lobbies').update({ 
-                turn_phase: 'buy_stocks', 
-                tile_ownership: updatedOwnership,
-                active_chains: lobbyInfo.active_chains.filter(c => c !== current_defunct),
-                chain_sizes: { ...lobbyInfo.chain_sizes, [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) + 1 }
-            }).eq('id', lobbyInfo.id);
-        }
+      const updatedOwnership = { ...lobbyInfo.tile_ownership };
+      Object.keys(updatedOwnership).forEach(k => {
+        if (updatedOwnership[k] === current_defunct) updatedOwnership[k] = survivor!;
+      });
+      
+      const remainingDefuncts = defunct_corps?.filter(c => c !== current_defunct) || [];
+      
+      if (remainingDefuncts.length > 0) {
+        await distributeBonuses(remainingDefuncts[0], lobbyInfo.chain_sizes[remainingDefuncts[0]]);
+        await supabase.from('lobbies').update({
+          merger_data: { ...lobbyInfo.merger_data, current_defunct: remainingDefuncts[0], defunct_corps: remainingDefuncts },
+          disposition_turn_index: lobbyInfo.current_turn_index,
+          tile_ownership: updatedOwnership,
+          active_chains: lobbyInfo.active_chains.filter(c => c !== current_defunct),
+          chain_sizes: {
+            ...lobbyInfo.chain_sizes,
+            [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0)
+          }
+        }).eq('id', lobbyInfo.id);
+      } else {
+        updatedOwnership[tile_placed!] = survivor!;
+        await supabase.from('lobbies').update({
+          turn_phase: 'buy_stocks',
+          tile_ownership: updatedOwnership,
+          active_chains: lobbyInfo.active_chains.filter(c => c !== current_defunct),
+          chain_sizes: {
+            ...lobbyInfo.chain_sizes,
+            [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) + 1
+          }
+        }).eq('id', lobbyInfo.id);
+      }
     }
     await supabase.from('players').update({ money: m, stocks: s }).eq('id', me.id);
     await supabase.from('lobbies').update({ disposition_turn_index: nextIdx }).eq('id', lobbyInfo.id);
@@ -292,13 +363,25 @@ export default function Home() {
     const hand = [...me.hand];
     if (pool.length > 0) hand.push(pool.pop()!);
     setStocksBoughtThisTurn(0);
+    
     const activePlayers = players.filter(p => !p.is_spectator);
     await supabase.from('players').update({ hand }).eq('id', me.id);
-    await supabase.from('lobbies').update({ 
-      tile_pool: pool, 
-      current_turn_index: (lobbyInfo.current_turn_index + 1) % activePlayers.length, 
-      turn_phase: 'place_tile' 
+    await supabase.from('lobbies').update({
+      tile_pool: pool,
+      current_turn_index: (lobbyInfo.current_turn_index + 1) % activePlayers.length,
+      turn_phase: 'place_tile'
     }).eq('id', lobbyInfo.id);
+  };
+
+  const handleSwapTile = async (tile: string) => {
+    if (!lobbyInfo || !me) return;
+    const pool = [...lobbyInfo.tile_pool];
+    if (pool.length === 0) return;
+    const newTile = pool.pop();
+    const newHand = me.hand.filter(t => t !== tile);
+    if (newTile) newHand.push(newTile);
+    await supabase.from('players').update({ hand: newHand }).eq('id', me.id);
+    await supabase.from('lobbies').update({ tile_pool: pool }).eq('id', lobbyInfo.id);
   };
 
   const handleEndGame = async () => {
@@ -308,7 +391,7 @@ export default function Home() {
     }
     const { data: finalP } = await supabase.from('players').select('*').eq('lobby_id', lobbyInfo.id);
     if (!finalP) return;
-    for (let p of finalP) {
+    for (const p of finalP) {
       let finalCash = p.money;
       CORPORATIONS.forEach(c => {
         if (p.stocks[c] > 0) finalCash += p.stocks[c] * getStockPrice(c, lobbyInfo.chain_sizes[c]);
@@ -318,56 +401,16 @@ export default function Home() {
     await supabase.from('lobbies').update({ status: 'finished' }).eq('id', lobbyInfo.id);
   };
 
-  // --- UI LOGIC ---
-  const handleCreateLobby = async (e: any) => {
-    e.preventDefault(); if (!playerName) return;
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const { data: l } = await supabase.from('lobbies').insert([{ join_code: code, status: 'waiting', turn_phase: 'place_tile', current_turn_index: 0, board_state: [], active_chains: [], chain_sizes: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), tile_ownership: {}, available_stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:25}),{}), tile_pool: [] }]).select().single();
-    if (l) { await supabase.from('players').insert([{ lobby_id: l.id, player_name: playerName, is_host: true, money: 6000, stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), hand: [] }]); setLobbyInfo(l as Lobby); setIsHost(true); }
-  };
-
-  const handleJoinLobby = async (e: any) => {
-    e.preventDefault(); 
-    if (!playerName || !joinCodeInput) return;
-
-    const { data: l } = await supabase
-      .from('lobbies')
-      .select('*')
-      .eq('join_code', joinCodeInput.toUpperCase())
-      .single();
-
-    if (l) {
-      const { count } = await supabase
-        .from('players')
-        .select('*', { count: 'exact', head: true })
-        .eq('lobby_id', l.id);
-
-      const { error } = await supabase.from('players').insert([{ 
-        lobby_id: l.id, 
-        player_name: playerName, 
-        is_host: false, 
-        is_spectator: (count || 0) >= 6, 
-        money: 6000, 
-        stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), 
-        hand: [] 
-      }]);
-
-      if (!error) {
-        setLobbyInfo(l as Lobby);
-      } else {
-        alert("Encryption Error: Could not join lobby.");
-      }
-    } else {
-      alert("Invalid Join Code. The Syndicate does not recognize this frequency.");
-    }
-  };
-
-  // --- RENEGADE START VALIDATION ---
+  // --- RENEGADE START (ADJACENCY LOGIC) ---
   const handleStartGame = async () => {
     if (!lobbyInfo) return;
     const active = players.filter(p => !p.is_spectator);
     let pool: string[] = [];
-    for (let r of BOARD_ROWS) for (let c of BOARD_COLS) pool.push(`${c}${r}`);
+    for (const r of BOARD_ROWS) {
+      for (const c of BOARD_COLS) {
+        pool.push(`${c}${r}`);
+      }
+    }
 
     let drawResults: { id: string, tile: string }[] = [];
     let isValidStart = false;
@@ -387,219 +430,350 @@ export default function Home() {
           const t2 = drawResults[j].tile;
           const col2 = parseInt(t2.match(/\d+/)?.[0] || '0');
           const row2 = t2.match(/[A-I]/)?.[0] || 'A';
-
-          const isAdj = (col1 === col2 && Math.abs(row1.charCodeAt(0) - row2.charCodeAt(0)) === 1) ||
-                        (row1 === row2 && Math.abs(col1 - col2) === 1);
-          
-          if (isAdj) {
-            hasAdjacency = true;
-            break;
-          }
+          const isAdj = (col1 === col2 && Math.abs(row1.charCodeAt(0) - row2.charCodeAt(0)) === 1) || (row1 === row2 && Math.abs(col1 - col2) === 1);
+          if (isAdj) { hasAdjacency = true; break; }
         }
         if (hasAdjacency) break;
       }
-
       if (!hasAdjacency) {
         isValidStart = true;
-        pool = tempPool; 
+        pool = tempPool;
       } else {
-        console.log("Adjacency detected in Draw Ceremony. Reshuffling Syndicate assets...");
+        console.log("Renegade Adjacency detected. Reshuffling tactical assets...");
       }
     }
 
     drawResults.sort((a, b) => getTileValue(a.tile) - getTileValue(b.tile));
-
     for (let i = 0; i < drawResults.length; i++) {
-      await supabase.from('players').update({ 
-        play_order: i, 
-        starting_tile: drawResults[i].tile, 
-        hand: pool.splice(-6) 
+      await supabase.from('players').update({
+        play_order: i,
+        starting_tile: drawResults[i].tile,
+        hand: pool.splice(-6)
       }).eq('id', drawResults[i].id);
     }
 
-    await supabase.from('lobbies').update({ 
-      status: 'playing', 
-      board_state: drawResults.map(r => r.tile), 
-      tile_pool: pool 
+    await supabase.from('lobbies').update({
+      status: 'playing',
+      board_state: drawResults.map(r => r.tile),
+      tile_pool: pool
     }).eq('id', lobbyInfo.id);
   };
 
+  // --- LOBBY JOIN/CREATE ---
+  const handleJoinLobby = async (e: any) => {
+    e.preventDefault();
+    if (!playerName || !joinCodeInput) return;
+    const { data: l } = await supabase.from('lobbies').select('*').eq('join_code', joinCodeInput.toUpperCase()).single();
+    if (l) {
+      const { count } = await supabase.from('players').select('*', { count: 'exact', head: true }).eq('lobby_id', l.id);
+      const { error } = await supabase.from('players').insert([{
+        lobby_id: l.id,
+        player_name: playerName,
+        is_host: false,
+        is_spectator: (count || 0) >= 6,
+        money: 6000,
+        stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
+        hand: []
+      }]);
+      if (!error) setLobbyInfo(l as Lobby);
+      else alert("Encryption Error.");
+    } else alert("Invalid Frequency.");
+  };
+
+  const handleCreateLobby = async (e: any) => {
+    e.preventDefault();
+    if (!playerName) return;
+    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const { data: l } = await supabase.from('lobbies').insert([{
+      join_code: code,
+      status: 'waiting',
+      turn_phase: 'place_tile',
+      current_turn_index: 0,
+      board_state: [],
+      active_chains: [],
+      chain_sizes: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
+      tile_ownership: {},
+      available_stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 25 }), {}),
+      tile_pool: []
+    }]).select().single();
+    
+    if (l) {
+      await supabase.from('players').insert([{
+        lobby_id: l.id,
+        player_name: playerName,
+        is_host: true,
+        money: 6000,
+        stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
+        hand: []
+      }]);
+      setLobbyInfo(l as Lobby);
+      setIsHost(true);
+    }
+  };
+
+  // --- TACTICAL SCANNER ---
+  const getTileLegality = (tile: string) => {
+    if (!lobbyInfo) return 'valid';
+    const col = parseInt(tile.match(/\d+/)?.[0] || '0');
+    const row = tile.match(/[A-I]/)?.[0] || 'A';
+    
+    const adj = [
+      `${col-1}${row}`, `${col+1}${row}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0)-1)}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0)+1)}`
+    ].filter(n => lobbyInfo.board_state.includes(n));
+
+    const neighboringCorps = Array.from(new Set(adj.map(n => lobbyInfo.tile_ownership[n]).filter((c): c is string => !!c)));
+    const safeCorps = neighboringCorps.filter(c => (lobbyInfo.chain_sizes[c] || 0) >= 11);
+    
+    if (safeCorps.length >= 2) return 'permanently_unplayable';
+    if (neighboringCorps.length === 0 && adj.length > 0 && lobbyInfo.active_chains.length >= 7) return 'temporarily_unplayable';
+    return 'valid';
+  };
+
   const netWorth = me ? (me.money + CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, lobbyInfo?.chain_sizes[c] || 0)), 0)) : 0;
-  const canEndGame = (lobbyInfo?.active_chains?.length === 7) && (Object.values(lobbyInfo?.chain_sizes || {}).some((s:any) => s >= 41) || lobbyInfo.active_chains.every((c:any) => (lobbyInfo.chain_sizes[c] || 0) >= 11));
+  const canEndGame = (lobbyInfo?.active_chains?.length === 7) && (Object.values(lobbyInfo?.chain_sizes || {}).some((s: any) => s >= 41) || lobbyInfo.active_chains.every((c: any) => (lobbyInfo.chain_sizes[c] || 0) >= 11));
   const isPoolLow = (lobbyInfo?.tile_pool?.length || 0) <= 10 && lobbyInfo?.status === 'playing';
 
+  // --- RENDERING ---
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase">
-      <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center z-50 sticky top-0">
+      <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center z-50 sticky top-0 shadow-lg">
         <div className="flex items-center gap-4">
-          <h1 className="text-xl font-black text-amber-500 italic">Acquire Syndicate</h1>
+          <h1 className="text-xl font-black text-amber-500 italic tracking-tighter">Syndicate Terminal</h1>
           {isPoolLow && (
             <div className="hidden md:flex items-center gap-2 bg-rose-500/10 border border-rose-500/50 px-3 py-1 rounded-full animate-pulse">
-              <span className="w-2 h-2 bg-rose-500 rounded-full shadow-[0_0_8px_rgba(244,63,94,0.8)]"></span>
-              <span className="text-[9px] font-black text-rose-500 tracking-widest uppercase">Resources Depleted: {lobbyInfo?.tile_pool?.length} Tiles Left</span>
+              <span className="w-2 h-2 bg-rose-500 rounded-full"></span>
+              <span className="text-[9px] font-black text-rose-500 tracking-widest uppercase">Stock Depleted: {lobbyInfo?.tile_pool?.length} Left</span>
             </div>
           )}
         </div>
         <div className="flex gap-2">
-            <button onClick={toggleVoice} className={`text-[9px] px-3 py-1 rounded-full border ${isMicActive ? 'bg-emerald-500 text-black animate-pulse' : 'bg-slate-800 text-slate-500 border-slate-700'}`}>
-              {isMicActive ? '🎙 Comms Live' : '🎤 Mic Off'}
-            </button>
-            {lobbyInfo?.status === 'playing' && canEndGame && me?.play_order === lobbyInfo.current_turn_index && (
-               <button onClick={handleEndGame} className="bg-rose-600 px-4 py-1 rounded-full font-black text-[9px] border border-rose-400">End Operation</button>
-            )}
-            {lobbyInfo && <span className="text-[10px] font-mono bg-amber-500/10 text-amber-500 px-3 py-1.5 rounded-full border border-amber-500/20">{lobbyInfo.join_code}</span>}
+          <button onClick={toggleVoice} className={`text-[9px] px-3 py-1 rounded-full border transition-all ${isMicActive ? 'bg-emerald-500 text-black border-emerald-400 animate-pulse' : 'bg-slate-800 text-slate-500 border-slate-700'}`}>
+            {isMicActive ? '🎙 Comms Active' : '🎤 Mic Muted'}
+          </button>
+          {lobbyInfo?.status === 'playing' && canEndGame && me?.play_order === lobbyInfo.current_turn_index && (
+            <button onClick={handleEndGame} className="bg-rose-600 px-4 py-1 rounded-full font-black text-[9px] border border-rose-400 hover:bg-rose-500 transition-colors">Terminate Mission</button>
+          )}
+          {lobbyInfo && <span className="text-[10px] font-mono bg-amber-500/10 text-amber-500 px-3 py-1.5 rounded-full border border-amber-500/20">{lobbyInfo.join_code}</span>}
         </div>
       </header>
 
-      <div className="flex-grow overflow-hidden">
+      <div className="flex-grow overflow-hidden relative">
         {lobbyInfo?.status === 'finished' ? (
-           <div className="flex flex-col items-center justify-center p-6 h-full">
-              <h2 className="text-5xl font-black text-amber-500 mb-8 italic">Standings</h2>
-              <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md space-y-4 shadow-2xl">
-                 {[...players].sort((a,b) => b.money - a.money).map((p, i) => (
-                    <div key={p.id} className={`flex justify-between items-center p-5 rounded-2xl border ${i === 0 ? 'border-amber-500 bg-amber-500/10' : 'border-slate-800 bg-slate-800/50'}`}>
-                       <span className="font-black text-lg">#{i+1} {p.player_name}</span>
-                       <span className="font-mono text-emerald-400 font-bold">${p.money.toLocaleString()}</span>
-                    </div>
-                 ))}
-              </div>
-              <button onClick={() => window.location.reload()} className="mt-10 bg-amber-500 text-black px-8 py-3 rounded-xl font-black uppercase">New Operation</button>
-           </div>
-        ) : !lobbyInfo ? (
-           <div className="max-w-md mx-auto pt-20 px-6 space-y-4">
-              <input type="text" value={playerName} onChange={e => setPlayerName(e.target.value)} className="w-full bg-slate-900 p-4 rounded-xl border border-slate-800 outline-none focus:border-amber-500 uppercase" placeholder="Agent Alias"/>
-              <div className="grid grid-cols-2 gap-4">
-                <button onClick={() => setView('create')} className="bg-amber-500 text-black font-black p-4 rounded-xl uppercase">Create</button>
-                <button onClick={() => setView('join')} className="border-2 border-amber-500 text-amber-500 font-black p-4 rounded-xl uppercase">Join</button>
-              </div>
-              {view === 'join' && <input type="text" value={joinCodeInput} onChange={e => setJoinCodeInput(e.target.value.toUpperCase())} className="w-full bg-slate-900 p-4 rounded-xl border border-slate-800 text-center font-mono uppercase" placeholder="XXXXXX"/>}
-              {(view === 'join' || view === 'create') && playerName && (
-                <button onClick={view === 'create' ? handleCreateLobby : handleJoinLobby} className="w-full bg-emerald-500 text-white font-black p-4 rounded-xl uppercase tracking-widest">Confirm Operation</button>
-              )}
-           </div>
-        ) : lobbyInfo.status === 'waiting' ? (
-           <div className="text-center pt-20">
-              <h2 className="text-6xl font-mono text-amber-400 mb-10 tracking-tighter">{lobbyInfo.join_code}</h2>
-              <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 w-80 mx-auto space-y-2 mb-10">
-                {players.map(p => <div key={p.id} className="text-sm font-bold flex justify-between uppercase"><span>{p.player_name}</span> {p.is_host && <span className="text-amber-500 text-[10px]">HOST</span>}</div>)}
-              </div>
-              {isHost && players.length >= 3 && <button onClick={handleStartGame} className="bg-emerald-500 px-12 py-4 rounded-2xl font-black text-white shadow-xl uppercase tracking-widest">Initiate Syndicate</button>}
-           </div>
-        ) : (
-           <div className="max-w-7xl mx-auto h-full grid grid-cols-1 lg:grid-cols-12 gap-0 lg:gap-6 lg:p-6">
-              <div className={`lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-3xl border border-slate-800 overflow-auto flex flex-col relative ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'}`}>
-                {lobbyInfo.turn_phase === 'found_chain' && me?.play_order === lobbyInfo.current_turn_index && (
-                  <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm z-40 flex items-center justify-center p-4">
-                    <div className="bg-slate-900 p-8 rounded-3xl border border-amber-500 shadow-2xl text-center">
-                      <h3 className="font-black text-amber-500 mb-6 uppercase tracking-widest">Found Building</h3>
-                      <div className="grid grid-cols-2 gap-3">
-                        {CORPORATIONS.filter(c => !lobbyInfo.active_chains.includes(c)).map(c => (
-                          <button key={c} onClick={() => handleFoundChain(c)} className={`${CORP_METADATA[c].bg} p-4 rounded-xl font-black text-xs uppercase`}>{c}</button>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                )}
-                {lobbyInfo.turn_phase === 'merger_resolution' && players[lobbyInfo.disposition_turn_index]?.player_name === playerName && (
-                  <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm z-40 flex items-center justify-center p-4">
-                    <div className="bg-slate-900 p-8 rounded-3xl border border-emerald-500 shadow-2xl text-center max-w-sm w-full">
-                      <h3 className="font-black text-emerald-400 mb-2 uppercase tracking-widest">Merger Disposition</h3>
-                      <p className="text-[10px] text-slate-500 mb-6 uppercase tracking-widest">{lobbyInfo.merger_data.current_defunct} is Defunct</p>
-                      <div className="flex flex-col gap-3">
-                        <button onClick={() => handleDisposition('sell')} className="bg-white text-black font-black py-4 rounded-xl uppercase">Sell All</button>
-                        <button onClick={() => handleDisposition('trade')} className="bg-amber-600 text-white font-black py-4 rounded-xl uppercase">Trade 2:1</button>
-                        <button onClick={() => handleDisposition('keep')} className="bg-slate-800 text-white font-bold py-3 rounded-xl border border-slate-700 uppercase">Keep All</button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                <div className="grid grid-cols-12 gap-1 mb-8">
-                  {BOARD_ROWS.map(r => BOARD_COLS.map(c => {
-                    const id = `${c}${r}`;
-                    const owner = lobbyInfo.tile_ownership[id];
-                    const isPlaced = lobbyInfo.board_state.includes(id);
-                    const isSafe = owner && (lobbyInfo.chain_sizes[owner] || 0) >= 11;
-                    return (
-                      <div key={id} className={`aspect-square flex flex-col items-center justify-center rounded-md text-[8px] lg:text-[10px] font-bold border transition-all ${isPlaced ? (owner ? `${CORP_METADATA[owner].bg} border-white shadow-md` : 'bg-amber-500 text-black border-amber-400 shadow-sm') : 'bg-slate-800/30 text-slate-700 border-slate-800/50'}`}>
-                        {id} {isSafe && <span className="text-[8px] mt-0.5">🛡️</span>}
-                      </div>
-                    );
-                  }))}
+          <div className="flex flex-col items-center justify-center p-6 h-full animate-in fade-in zoom-in duration-500">
+            <h2 className="text-5xl font-black text-amber-500 mb-8 italic tracking-tighter">Asset Liquidation Standings</h2>
+            <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md space-y-4 shadow-2xl">
+              {[...players].sort((a, b) => b.money - a.money).map((p, i) => (
+                <div key={p.id} className={`flex justify-between items-center p-5 rounded-2xl border transition-all ${i === 0 ? 'border-amber-500 bg-amber-500/10 scale-105' : 'border-slate-800 bg-slate-800/50'}`}>
+                  <span className="font-black text-lg">#{i + 1} {p.player_name}</span>
+                  <span className="font-mono text-emerald-400 font-bold">${p.money.toLocaleString()}</span>
                 </div>
-                <div className="flex justify-center gap-2 mt-auto">
-                   {me?.hand?.map((t: string) => (
-                      <button key={t} onClick={() => handlePlaceTile(t)} disabled={lobbyInfo.current_turn_index !== me.play_order || lobbyInfo.turn_phase !== 'place_tile'} className="w-12 h-12 lg:w-16 lg:h-16 bg-amber-500 text-black font-black rounded-xl shadow-xl hover:scale-110 disabled:opacity-20 transition-all uppercase">{t}</button>
-                   ))}
+              ))}
+            </div>
+            <button onClick={() => window.location.reload()} className="mt-10 bg-amber-500 text-black px-8 py-3 rounded-xl font-black uppercase hover:bg-amber-400 transition-colors">Return to Base</button>
+          </div>
+        ) : !lobbyInfo ? (
+          <div className="max-w-md mx-auto pt-20 px-6 space-y-4">
+            <div className="text-center mb-10">
+              <p className="text-[10px] text-amber-500 font-black tracking-[0.3em] mb-2">Authenticated Connection Required</p>
+              <h2 className="text-4xl font-black italic tracking-tighter text-slate-100">Establish Link</h2>
+            </div>
+            <input type="text" value={playerName} onChange={e => setPlayerName(e.target.value)} className="w-full bg-slate-900 p-4 rounded-xl border border-slate-800 outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 uppercase transition-all" placeholder="Agent Pseudonym" />
+            <div className="grid grid-cols-2 gap-4">
+              <button onClick={() => setView('create')} className={`font-black p-4 rounded-xl uppercase transition-all ${view === 'create' ? 'bg-amber-500 text-black' : 'bg-slate-800 text-slate-400'}`}>Create</button>
+              <button onClick={() => setView('join')} className={`font-black p-4 rounded-xl uppercase transition-all ${view === 'join' ? 'bg-amber-500 text-black' : 'bg-slate-800 text-slate-400'}`}>Join</button>
+            </div>
+            {view === 'join' && <input type="text" value={joinCodeInput} onChange={e => setJoinCodeInput(e.target.value.toUpperCase())} className="w-full bg-slate-900 p-4 rounded-xl border border-slate-800 text-center font-mono uppercase focus:border-amber-500 outline-none transition-all" placeholder="HEX CODE" />}
+            {(view === 'join' || view === 'create') && playerName && (
+              <button onClick={view === 'create' ? handleCreateLobby : handleJoinLobby} className="w-full bg-emerald-500 text-white font-black p-4 rounded-xl uppercase tracking-widest hover:bg-emerald-400 transition-all shadow-lg shadow-emerald-500/20">Authorize Transmission</button>
+            )}
+          </div>
+        ) : lobbyInfo.status === 'waiting' ? (
+          <div className="text-center pt-20 animate-in fade-in duration-700">
+            <p className="text-[10px] text-slate-500 font-black tracking-widest mb-4">Frequency Established</p>
+            <h2 className="text-7xl font-mono text-amber-400 mb-10 tracking-tighter border-y border-slate-800 py-6 inline-block px-12">{lobbyInfo.join_code}</h2>
+            <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 w-80 mx-auto space-y-2 mb-10 shadow-xl">
+              <p className="text-[8px] text-slate-600 font-black mb-4 tracking-widest">Active Operatives</p>
+              {players.map(p => <div key={p.id} className="text-sm font-bold flex justify-between uppercase py-1"><span>{p.player_name}</span> {p.is_host && <span className="text-amber-500 text-[10px]">HOST</span>}</div>)}
+            </div>
+            {isHost && players.length >= 3 && <button onClick={handleStartGame} className="bg-emerald-500 px-12 py-4 rounded-2xl font-black text-white shadow-xl shadow-emerald-500/20 uppercase tracking-widest hover:scale-105 transition-all">Initiate Operations</button>}
+          </div>
+        ) : (
+          <div className="max-w-7xl mx-auto h-full grid grid-cols-1 lg:grid-cols-12 gap-0 lg:gap-6 lg:p-6 overflow-hidden">
+            {/* --- MAIN THEATER --- */}
+            <div className={`lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-3xl border border-slate-800 overflow-auto flex flex-col relative shadow-inner ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'}`}>
+              
+              {/* FOUNDING OVERLAY */}
+              {lobbyInfo.turn_phase === 'found_chain' && me?.play_order === lobbyInfo.current_turn_index && (
+                <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md z-40 flex items-center justify-center p-4">
+                  <div className="bg-slate-900 p-8 rounded-3xl border border-amber-500 shadow-2xl text-center max-w-sm w-full">
+                    <h3 className="font-black text-amber-500 mb-2 uppercase tracking-widest">Establish Infrastructure</h3>
+                    <p className="text-[9px] text-slate-500 mb-6 font-bold uppercase tracking-widest">Select an available syndicate to represent this expansion</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      {CORPORATIONS.filter(c => !lobbyInfo.active_chains.includes(c)).map(c => (
+                        <button key={c} onClick={() => handleFoundChain(c)} className={`${CORP_METADATA[c].bg} p-4 rounded-xl font-black text-[10px] uppercase shadow-lg hover:brightness-125 transition-all`}>{c}</button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* MERGER OVERLAY */}
+              {lobbyInfo.turn_phase === 'merger_resolution' && players[lobbyInfo.disposition_turn_index]?.player_name === playerName && (
+                <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md z-40 flex items-center justify-center p-4">
+                  <div className="bg-slate-900 p-8 rounded-3xl border border-emerald-500 shadow-2xl text-center max-w-sm w-full">
+                    <h3 className="font-black text-emerald-400 mb-1 uppercase tracking-widest">Hostile Acquisition</h3>
+                    <p className="text-[9px] text-slate-400 font-bold mb-6 uppercase tracking-widest">{lobbyInfo.merger_data.current_defunct} is being liquidated</p>
+                    <div className="flex flex-col gap-3">
+                      <button onClick={() => handleDisposition('sell')} className="bg-white text-black font-black py-4 rounded-xl uppercase hover:bg-slate-200 transition-all">Sell Assets</button>
+                      <button onClick={() => handleDisposition('trade')} className="bg-amber-600 text-white font-black py-4 rounded-xl uppercase hover:bg-amber-500 transition-all">Trade 2:1 for {lobbyInfo.merger_data.survivor}</button>
+                      <button onClick={() => handleDisposition('keep')} className="bg-slate-800 text-white font-bold py-3 rounded-xl border border-slate-700 uppercase">Maintain Portfolio</button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* GRID */}
+              <div className="grid grid-cols-12 gap-1 mb-8 p-1 bg-slate-950/50 rounded-xl border border-slate-800/50">
+                {BOARD_ROWS.map(r => BOARD_COLS.map(c => {
+                  const id = `${c}${r}`;
+                  const owner = lobbyInfo.tile_ownership[id];
+                  const isPlaced = lobbyInfo.board_state.includes(id);
+                  const isSafe = owner && (lobbyInfo.chain_sizes[owner] || 0) >= 11;
+                  return (
+                    <div key={id} className={`aspect-square flex flex-col items-center justify-center rounded-md text-[8px] lg:text-[10px] font-bold border transition-all duration-300 ${isPlaced ? (owner ? `${CORP_METADATA[owner].bg} border-white/30 shadow-[0_0_15px_rgba(255,255,255,0.1)]` : 'bg-amber-500 text-black border-amber-400 shadow-[0_0_10px_rgba(245,158,11,0.3)] scale-95') : 'bg-slate-800/20 text-slate-700 border-slate-800/40'}`}>
+                      {id} {isSafe && <span className="text-[7px] mt-0.5 animate-pulse">🛡️</span>}
+                    </div>
+                  );
+                }))}
+              </div>
+
+              {/* HAND TACTICAL SCANNER */}
+              <div className="flex justify-center gap-2 mt-auto pb-4">
+                {me?.hand?.map((t: string) => {
+                  const legality = getTileLegality(t);
+                  const isMyTurn = lobbyInfo.current_turn_index === me.play_order;
+                  const isPlacePhase = lobbyInfo.turn_phase === 'place_tile';
+                  
+                  return (
+                    <div key={t} className="relative group">
+                      <button 
+                        onClick={() => handlePlaceTile(t)} 
+                        disabled={!isMyTurn || !isPlacePhase || legality !== 'valid'} 
+                        className={`w-12 h-12 lg:w-16 lg:h-16 font-black rounded-xl shadow-2xl transition-all uppercase relative overflow-hidden flex items-center justify-center
+                          ${legality === 'valid' ? 'bg-amber-500 text-black hover:scale-110 active:scale-95 disabled:opacity-20' : ''}
+                          ${legality === 'temporarily_unplayable' ? 'bg-slate-800 text-slate-600 border border-slate-700 cursor-not-allowed' : ''}
+                          ${legality === 'permanently_unplayable' ? 'bg-rose-950/50 text-rose-500 border border-rose-500/30' : ''}
+                        `}
+                      >
+                        <span className="z-10">{t}</span>
+                        {legality === 'permanently_unplayable' && isMyTurn && isPlacePhase && (
+                          <div onClick={(e) => { e.stopPropagation(); handleSwapTile(t); }} className="absolute inset-0 bg-rose-600 text-white flex items-center justify-center text-[7px] font-black opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer">SWAP TILE</div>
+                        )}
+                        <div className="absolute inset-0 bg-gradient-to-tr from-white/10 to-transparent opacity-50" />
+                      </button>
+                      {legality !== 'valid' && (
+                        <div className="absolute -top-10 left-1/2 -translate-x-1/2 bg-black/90 text-[7px] px-3 py-1.5 rounded-lg border border-slate-800 opacity-0 group-hover:opacity-100 whitespace-nowrap z-50 pointer-events-none transition-all shadow-xl">
+                          {legality === 'permanently_unplayable' ? 'ILLEGAL MERGER: SAFE CHAINS' : 'FOUNDING CAP REACHED (MAX 7)'}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* --- INTELLIGENCE PANEL --- */}
+            <div className={`lg:col-span-4 flex flex-col gap-4 overflow-y-auto pb-24 lg:pb-0 ${mobileTab !== 'market' ? 'hidden lg:flex' : 'flex'}`}>
+              
+              <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-lg">
+                <h3 className="text-[9px] font-black text-slate-500 mb-3 uppercase tracking-widest">Draw Ceremony Results</h3>
+                <div className="space-y-1">
+                  {players.map(p => (
+                    <div key={p.id} className={`flex justify-between items-center px-4 py-2.5 rounded-xl border transition-all ${p.play_order === lobbyInfo.current_turn_index ? 'border-amber-500 bg-amber-500/5 shadow-[0_0_10px_rgba(245,158,11,0.1)]' : 'border-transparent bg-slate-800/50'}`}>
+                      <span className="text-xs font-bold uppercase tracking-tight">{p.player_name}</span>
+                      <span className="text-[9px] font-black bg-slate-950 px-3 py-1.5 rounded-lg text-amber-500 font-mono tracking-tighter shadow-inner border border-slate-800 uppercase">{p.starting_tile}</span>
+                    </div>
+                  ))}
                 </div>
               </div>
 
-              <div className={`lg:col-span-4 flex flex-col gap-4 overflow-y-auto pb-24 lg:pb-0 ${mobileTab !== 'market' ? 'hidden lg:flex' : 'flex'}`}>
-                 <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800">
-                    <h3 className="text-[9px] font-black text-slate-500 mb-3 uppercase tracking-widest">Draw Ceremony</h3>
-                    <div className="space-y-1">
-                       {players.map(p => (
-                          <div key={p.id} className={`flex justify-between items-center px-3 py-2 rounded-lg border ${p.play_order === lobbyInfo.current_turn_index ? 'border-amber-500 bg-amber-500/5' : 'border-transparent bg-slate-800/50'}`}>
-                             <span className="text-xs font-bold uppercase">{p.player_name}</span>
-                             <span className="text-[9px] font-black bg-slate-900 px-2 py-1 rounded text-amber-500 font-mono tracking-tighter uppercase">{p.starting_tile}</span>
-                          </div>
-                       ))}
+              <div className="bg-slate-900 p-6 rounded-3xl border border-amber-500/20 shadow-2xl relative overflow-hidden group">
+                <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
+                   <span className="text-4xl font-black italic">ASSET</span>
+                </div>
+                <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase border-b border-slate-800 pb-2 tracking-widest">Portfolio Matrix</h3>
+                <div className="flex justify-between items-end mb-6">
+                  <div>
+                    <p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest mb-1">Available Liquidity</p>
+                    <p className="text-3xl font-black text-emerald-400 font-mono tracking-tighter">${me?.money.toLocaleString()}</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest mb-1">Total Net Worth</p>
+                    <p className="text-sm font-bold font-mono text-slate-100">${netWorth.toLocaleString()}</p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {CORPORATIONS.map(c => (
+                    <div key={c} className={`flex justify-between items-center text-[10px] font-bold p-3 rounded-xl border transition-all ${me?.stocks[c] ? 'bg-slate-800 border-slate-700 opacity-100' : 'bg-slate-900/50 border-transparent opacity-20 grayscale'}`}>
+                      <span className="uppercase tracking-tighter">{c}</span>
+                      <span className="font-mono text-amber-500 bg-black/40 px-2 py-0.5 rounded-md shadow-inner">{me?.stocks[c] || 0}</span>
                     </div>
-                 </div>
-                 <div className="bg-slate-900 p-6 rounded-3xl border border-amber-500/20 shadow-xl">
-                    <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase border-b border-slate-800 pb-2 tracking-widest">Portfolio</h3>
-                    <div className="flex justify-between items-end mb-6">
-                       <div><p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest">Cash</p><p className="text-3xl font-black text-emerald-400 font-mono">${me?.money.toLocaleString()}</p></div>
-                       <div className="text-right"><p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest">Net Worth</p><p className="text-sm font-bold font-mono text-slate-100">${netWorth.toLocaleString()}</p></div>
-                    </div>
-                    <div className="space-y-1">
-                       {CORPORATIONS.map(c => (
-                          <div key={c} className={`flex justify-between text-[10px] font-bold p-2.5 rounded-xl bg-slate-800/50 border border-slate-700/30 ${me?.stocks[c] ? 'opacity-100' : 'opacity-10 grayscale'}`}>
-                             <span className="uppercase tracking-tighter">{c}</span><span className="font-mono text-amber-500">{me?.stocks[c] || 0}</span>
-                          </div>
-                       ))}
-                    </div>
-                 </div>
-                 <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 shadow-xl flex-grow">
-                    <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase tracking-widest">Exchange</h3>
-                    <div className="space-y-2">
-                       {CORPORATIONS.map(c => {
-                          const size = lobbyInfo.chain_sizes[c] || 0;
-                          const active = lobbyInfo.active_chains.includes(c);
-                          const price = getStockPrice(c, size);
-                          return (
-                            <div key={c} className={`w-full flex justify-between items-center p-3 rounded-xl font-black text-[10px] border ${active ? 'bg-slate-800 border-slate-700' : 'opacity-10 border-transparent'}`}>
-                              <span>{c} ({size})</span>
-                              <div className="flex items-center gap-3">
-                                <span className="text-emerald-400 font-mono">${price}</span>
-                                <button onClick={() => handleBuyStock(c)} disabled={!active || lobbyInfo.current_turn_index !== me?.play_order || stocksBoughtThisTurn >= 3 || (me?.money || 0) < price || (lobbyInfo.available_stocks[c] || 0) <= 0} className="bg-amber-500 text-black px-2 py-1 rounded text-[9px] disabled:opacity-0 uppercase tracking-widest">Buy</button>
-                              </div>
-                            </div>
-                          );
-                       })}
-                       {lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks' && (
-                          <button onClick={handleEndTurn} className="w-full bg-emerald-600 py-4 rounded-2xl font-black text-[10px] mt-4 uppercase tracking-widest shadow-lg flex justify-center items-center gap-2">
-                            <span>Commit & End Turn</span>
-                            <span className="bg-black/20 px-2 py-0.5 rounded-md text-[8px]">({stocksBoughtThisTurn}/3)</span>
-                          </button>
-                       )}
-                    </div>
-                 </div>
+                  ))}
+                </div>
               </div>
-           </div>
+
+              <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 shadow-2xl flex-grow flex flex-col">
+                <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase tracking-widest">Market Exchange</h3>
+                <div className="space-y-2 flex-grow overflow-auto pr-2">
+                  {CORPORATIONS.map(c => {
+                    const size = lobbyInfo.chain_sizes[c] || 0;
+                    const active = lobbyInfo.active_chains.includes(c);
+                    const price = getStockPrice(c, size);
+                    const canBuy = active && (lobbyInfo.current_turn_index === me?.play_order) && (stocksBoughtThisTurn < 3) && ((me?.money || 0) >= price) && ((lobbyInfo.available_stocks[c] || 0) > 0);
+                    
+                    return (
+                      <div key={c} className={`w-full flex justify-between items-center p-3 rounded-xl font-black text-[11px] border transition-all ${active ? 'bg-slate-800 border-slate-700 shadow-md' : 'opacity-10 border-transparent grayscale'}`}>
+                        <div className="flex items-center gap-3">
+                          <div className={`w-1 h-6 rounded-full ${CORP_METADATA[c].bg}`} />
+                          <div className="flex flex-col">
+                            <span className="tracking-tight">{c}</span>
+                            <span className="text-[8px] text-slate-500">SIZE: {size} | AVAIL: {lobbyInfo.available_stocks[c]}</span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-4">
+                          <span className="text-emerald-400 font-mono text-sm">${price}</span>
+                          <button onClick={() => handleBuyStock(c)} disabled={!canBuy} className={`px-4 py-2 rounded-lg text-[10px] uppercase tracking-widest shadow-md transition-all ${canBuy ? 'bg-amber-500 text-black hover:bg-amber-400 active:scale-90' : 'bg-slate-950 text-slate-700 cursor-not-allowed opacity-0'}`}>Buy</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks' && (
+                  <button onClick={handleEndTurn} className="w-full bg-emerald-600 py-5 rounded-2xl font-black text-[11px] mt-6 uppercase tracking-[0.2em] shadow-lg shadow-emerald-500/10 flex justify-center items-center gap-3 hover:bg-emerald-500 transition-all active:scale-95 group">
+                    <span>COMMIT & TRANSMIT MOVE</span>
+                    <span className="bg-black/20 px-3 py-1 rounded-lg text-[9px] font-mono group-hover:bg-black/30">({stocksBoughtThisTurn}/3)</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
         )}
       </div>
 
-      {/* MOBILE NAV */}
+      {/* MOBILE NAV TABS */}
       {lobbyInfo?.status === 'playing' && (
-        <nav className="lg:hidden h-20 bg-slate-900 border-t border-slate-800 grid grid-cols-2 items-center z-50 fixed bottom-0 left-0 right-0">
-          <button onClick={() => setMobileTab('board')} className={`flex flex-col items-center gap-1 ${mobileTab === 'board' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">◫</span><span className="text-[8px] font-black tracking-widest">Board</span></button>
-          <button onClick={() => setMobileTab('market')} className={`flex flex-col items-center gap-1 ${mobileTab === 'market' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">＄</span><span className="text-[8px] font-black tracking-widest">Market</span></button>
+        <nav className="lg:hidden h-20 bg-slate-900 border-t border-slate-800 grid grid-cols-2 items-center z-50 fixed bottom-0 left-0 right-0 shadow-2xl">
+          <button onClick={() => setMobileTab('board')} className={`flex flex-col items-center gap-1 transition-all ${mobileTab === 'board' ? 'text-amber-500' : 'text-slate-600'}`}>
+            <span className="text-2xl font-black">◫</span>
+            <span className="text-[8px] font-black tracking-widest">TACTICAL GRID</span>
+          </button>
+          <button onClick={() => setMobileTab('market')} className={`flex flex-col items-center gap-1 transition-all ${mobileTab === 'market' ? 'text-amber-500' : 'text-slate-600'}`}>
+            <span className="text-2xl font-black">＄</span>
+            <span className="text-[8px] font-black tracking-widest">MARKET EXCHANGE</span>
+          </button>
         </nav>
-      )}
-      {isPoolLow && (
-        <div className="md:hidden h-6 bg-rose-600 text-[8px] font-black text-white flex items-center justify-center tracking-tighter fixed bottom-20 left-0 right-0 z-40 animate-pulse">
-           Resources Depleted: {lobbyInfo?.tile_pool?.length} Tiles Left
-        </div>
       )}
     </main>
   );
