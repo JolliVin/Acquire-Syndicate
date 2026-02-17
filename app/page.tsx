@@ -89,6 +89,7 @@ export default function Home() {
   const peerInstance = useRef<Peer | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
+  // --- DATA SYNC ---
   useEffect(() => {
     if (!lobbyInfo) return;
     const fetchData = async () => {
@@ -111,7 +112,7 @@ export default function Home() {
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
-  // --- VOICE (PeerJS) ---
+  // --- VOICE ---
   const me = players.find(p => p.player_name === playerName);
   useEffect(() => {
     if (!me?.id || typeof window === 'undefined') return;
@@ -138,14 +139,11 @@ export default function Home() {
     } catch (err) { alert("Mic Access Denied."); }
   };
 
-  // --- GAME FUNCTIONS ---
+  // --- GAME LOGIC ---
   const getNeighbors = (t: string) => {
     const c = parseInt(t.match(/\d+/)?.[0] || '0');
     const r = BOARD_ROWS.indexOf(t.match(/[A-I]/)?.[0] || 'A');
-    const n = [];
-    if (c > 1) n.push(`${c-1}${BOARD_ROWS[r]}`); if (c < 12) n.push(`${c+1}${BOARD_ROWS[r]}`);
-    if (r > 0) n.push(`${c}${BOARD_ROWS[r-1]}`); if (r < 8) n.push(`${c}${BOARD_ROWS[r+1]}`);
-    return n;
+    return [`${c-1}${BOARD_ROWS[r]}`, `${c+1}${BOARD_ROWS[r]}`, `${c}${BOARD_ROWS[r-1]}`, `${c}${BOARD_ROWS[r+1]}`];
   };
 
   const calculateMergerBonuses = (corp: string, currentPlayers: Player[]) => {
@@ -187,7 +185,7 @@ export default function Home() {
       }
     }
     await supabase.from('players').upsert(updates);
-    await supabase.from('lobbies').update({ status: 'playing', board_state: updates.map(u => u.starting_tile), tile_pool: pool, turn_phase: 'place_tile', current_turn_index: 0, chain_sizes: CORPORATIONS.reduce((acc,c)=>({...acc,[c]:0}),{}), tile_ownership: updates.reduce((acc,u)=>({...acc,[u.starting_tile]:null}),{}) }).eq('id', lobbyInfo.id);
+    await supabase.from('lobbies').update({ status: 'playing', board_state: updates.map(u => u.starting_tile), tile_pool: pool, turn_phase: 'place_tile', current_turn_index: 0, chain_sizes: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), tile_ownership: updates.reduce((a,u)=>({...a,[u.starting_tile]:null}),{}) }).eq('id', lobbyInfo.id);
     setIsStarting(false);
   };
 
@@ -216,14 +214,6 @@ export default function Home() {
     }
     await supabase.from('players').update({ hand: cur.hand.filter(t => t !== tile) }).eq('id', cur.id);
     await supabase.from('lobbies').update({ board_state: [...lobbyInfo.board_state, tile], turn_phase: next, merger_data: mergerData, disposition_turn_index: lobbyInfo.current_turn_index }).eq('id', lobbyInfo.id);
-  };
-
-  const handleSelectSurvivor = async (survivor: string) => {
-    const defunct = lobbyInfo!.merger_data.defunct_corps?.find((c:string) => c !== survivor);
-    if (!defunct) return;
-    const payouts = calculateMergerBonuses(defunct, players);
-    for (const p of payouts) await supabase.from('players').update({ money: p.money }).eq('id', p.id);
-    await supabase.from('lobbies').update({ merger_data: { ...lobbyInfo!.merger_data, survivor, current_defunct: defunct, is_tied: false }}).eq('id', lobbyInfo!.id);
   };
 
   const handleDisposition = async (action: 'sell' | 'trade' | 'keep') => {
@@ -276,13 +266,21 @@ export default function Home() {
     setChatInput('');
   };
 
-  // --- RENDERING ---
+  // --- PORTFOLIO CALC ---
+  const myStocks = me?.stocks || {};
+  const totalStockValue = CORPORATIONS.reduce((acc, corp) => {
+    const count = myStocks[corp] || 0;
+    const price = lobbyInfo?.status === 'playing' ? getStockPrice(corp, lobbyInfo.chain_sizes[corp]) : 0;
+    return acc + (count * price);
+  }, 0);
+  const netWorth = (me?.money || 0) + totalStockValue;
+
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
+    <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center sticky top-0 z-40">
-        <h1 className="text-xl font-black text-amber-500 italic">ACQUIRE SYNDICATE</h1>
+        <h1 className="text-xl font-black text-amber-500 italic tracking-tighter">ACQUIRE SYNDICATE</h1>
         <div className="flex gap-2">
-           <button onClick={toggleVoice} className={`text-[10px] px-3 py-1.5 rounded-full border ${isMicActive ? 'bg-emerald-500 text-black animate-pulse' : 'bg-slate-800 text-slate-400'}`}>
+           <button onClick={toggleVoice} className={`text-[10px] px-3 py-1.5 rounded-full border transition-all ${isMicActive ? 'bg-emerald-500 text-black animate-pulse font-bold' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
               {isMicActive ? '🎙 COMMS LIVE' : '🎤 MIC ON'}
            </button>
            {lobbyInfo && <span className="text-[10px] font-mono bg-amber-500/10 text-amber-500 px-3 py-1.5 rounded-full border border-amber-500/20">{lobbyInfo.join_code}</span>}
@@ -309,7 +307,7 @@ export default function Home() {
                             .then(({data: l}) => { if(l) { supabase.from('players').insert([{ lobby_id: l.id, player_name: playerName, is_host: true, money: 6000, stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}) }]).then(() => { setLobbyInfo(l as Lobby); setIsHost(true); }) } });
                         }} className="flex flex-col gap-4">
                           <input type="text" maxLength={10} required value={playerName} onChange={e => setPlayerName(e.target.value)} className="bg-slate-800 p-4 rounded-xl outline-none" placeholder="Agent Alias"/>
-                          <button type="submit" className="bg-amber-500 text-black font-black py-4 rounded-xl">CREATE</button>
+                          <button type="submit" className="bg-amber-500 text-black font-black py-4 rounded-xl">ESTABLISH</button>
                         </form>
                       )}
                       {view === 'join' && (
@@ -336,7 +334,7 @@ export default function Home() {
                       <h2 className="text-5xl font-mono font-black text-amber-400 mb-8">{lobbyInfo.join_code}</h2>
                       <div className="bg-slate-900 p-6 rounded-3xl mb-6 shadow-xl border border-slate-800">
                          <div className="text-[10px] uppercase text-slate-500 mb-2 font-bold tracking-widest">Active Agents ({players.filter(p=>!p.is_spectator).length}/6)</div>
-                         {players.map(p => <div key={p.id} className="py-2 flex justify-between border-b border-slate-800/50 last:border-0"><span>{p.player_name}</span>{p.is_spectator ? '👁' : (p.is_host && '★')}</div>)}
+                         {players.map(p => <div key={p.id} className="py-2 flex justify-between border-b border-slate-800/50 last:border-0 text-sm font-medium"><span>{p.player_name}</span>{p.is_spectator ? '👁' : (p.is_host && '★')}</div>)}
                       </div>
                       {isHost && players.length >= 3 && <button onClick={handleStartGame} className="bg-emerald-500 px-12 py-4 rounded-2xl font-black shadow-lg hover:scale-105 transition-all">START OPERATION</button>}
                    </div>
@@ -344,15 +342,15 @@ export default function Home() {
              </div>
           ) : (
             <>
-              {/* BOARD */}
-              <div className={`lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-2xl border border-slate-800 overflow-auto ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'} flex-col relative`}>
+              {/* BOARD VIEW */}
+              <div className={`lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-3xl border border-slate-800 overflow-auto ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'} flex-col relative shadow-inner`}>
                 {lobbyInfo.turn_phase === 'found_chain' && players.find(p => p.play_order === lobbyInfo.current_turn_index)?.player_name === playerName && (
                     <div className="absolute inset-0 z-30 bg-slate-950/90 flex items-center justify-center p-6 backdrop-blur-sm">
                         <div className="text-center bg-slate-900 p-8 rounded-3xl border border-amber-500 shadow-2xl">
                             <h2 className="text-xl font-black text-amber-400 mb-6 uppercase tracking-widest">Found Corporation</h2>
                             <div className="grid grid-cols-2 gap-2">
                                 {CORPORATIONS.filter(c => !lobbyInfo.active_chains.includes(c)).map(corp => (
-                                    <button key={corp} onClick={() => handleFoundChain(corp)} className={`${CORP_METADATA[corp].bg} text-white p-4 rounded-xl font-black text-xs`}>{corp}</button>
+                                    <button key={corp} onClick={() => handleFoundChain(corp)} className={`${CORP_METADATA[corp].bg} ${CORP_METADATA[corp].text} p-4 rounded-xl font-black text-xs uppercase`}>{corp}</button>
                                 ))}
                             </div>
                         </div>
@@ -381,14 +379,39 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* MARKET & CHAT */}
-              <div className={`lg:col-span-4 flex flex-col gap-4 ${mobileTab !== 'market' ? 'hidden lg:flex' : 'flex'}`}>
+              {/* MARKET & PORTFOLIO SIDEBAR */}
+              <div className={`lg:col-span-4 flex flex-col gap-4 ${mobileTab !== 'market' ? 'hidden lg:flex' : 'flex'} overflow-y-auto pb-20 lg:pb-0`}>
+                 
+                 {/* PORTFOLIO SUMMARY */}
+                 <div className="bg-slate-900 p-6 rounded-3xl border border-amber-500/30 shadow-2xl relative overflow-hidden group">
+                    <h3 className="text-[10px] font-black text-slate-500 uppercase mb-4 tracking-widest">Syndicate Portfolio</h3>
+                    <div className="flex justify-between items-end">
+                       <div>
+                          <p className="text-[9px] text-slate-500 uppercase font-bold">Total Net Worth</p>
+                          <p className="text-3xl font-black text-emerald-400 font-mono tracking-tighter">${netWorth.toLocaleString()}</p>
+                       </div>
+                       <div className="text-right">
+                          <p className="text-[9px] text-slate-500 uppercase font-bold">Liquid Cash</p>
+                          <p className="text-sm font-bold font-mono text-slate-100">${me?.money.toLocaleString()}</p>
+                       </div>
+                    </div>
+                    <div className="mt-4 flex flex-wrap gap-2">
+                       {CORPORATIONS.map(corp => myStocks[corp] > 0 && (
+                          <div key={corp} className={`px-2 py-1 rounded-md text-[9px] font-bold border flex gap-2 items-center ${CORP_METADATA[corp].bg} ${CORP_METADATA[corp].text} border-white/20`}>
+                             <span>{corp}</span>
+                             <span className="opacity-60">|</span>
+                             <span>{myStocks[corp]} Shares</span>
+                          </div>
+                       ))}
+                    </div>
+                 </div>
+
                  {/* SHADOW MARKET */}
-                 <div className="bg-slate-900 p-5 rounded-3xl border border-slate-800 shadow-xl overflow-y-auto">
-                    <h3 className="text-[10px] font-black text-slate-500 uppercase mb-4 tracking-widest">Syndicate Market</h3>
+                 <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 shadow-xl">
+                    <h3 className="text-[10px] font-black text-slate-500 uppercase mb-4 tracking-widest">Market Exchange</h3>
                     <table className="w-full text-left">
                        <thead className="text-[8px] text-slate-600 uppercase border-b border-slate-800">
-                          <tr><th className="pb-2">Corporation</th><th className="pb-2">Price</th><th className="pb-2 text-right">Action</th></tr>
+                          <tr><th className="pb-2">Corp</th><th className="pb-2">Price</th><th className="pb-2 text-right">Action</th></tr>
                        </thead>
                        <tbody className="text-xs">
                           {CORPORATIONS.map(corp => {
@@ -405,7 +428,7 @@ export default function Home() {
                                    <td className="py-3 font-mono text-emerald-400 font-black">${price}</td>
                                    <td className="py-3 text-right">
                                       {isSoldOut ? (
-                                         <span className="text-[8px] font-black text-rose-500 border border-rose-500/30 px-2 py-1 rounded uppercase">Depleted</span>
+                                         <span className="text-[8px] font-black text-rose-500 uppercase tracking-tighter">Depleted</span>
                                       ) : (
                                          <button 
                                             onClick={() => handleBuyStock(corp)}
@@ -421,14 +444,15 @@ export default function Home() {
                     </table>
                     {lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks' && (
                        <div className="mt-4 pt-4 border-t border-slate-800">
-                          <p className="text-[9px] text-slate-500 uppercase mb-2">Capacity: {3 - stocksBoughtThisTurn} Remaining</p>
-                          <button onClick={handleEndTurn} className="w-full bg-emerald-600 py-3 rounded-xl font-black text-sm hover:bg-emerald-500 transition-all">CONCLUDE TURN</button>
+                          <p className="text-[9px] text-slate-500 uppercase mb-2 font-bold">Buy Limit: {3 - stocksBoughtThisTurn} Remaining</p>
+                          <button onClick={handleEndTurn} className="w-full bg-emerald-600 py-3 rounded-xl font-black text-sm hover:bg-emerald-500 transition-all shadow-lg">CONCLUDE TURN</button>
                        </div>
                     )}
                  </div>
 
-                 {/* COMMS */}
-                 <div className="bg-slate-900 rounded-3xl border border-slate-800 flex flex-col h-[200px] shadow-xl">
+                 {/* SECURE COMMS */}
+                 <div className="bg-slate-900 rounded-3xl border border-slate-800 flex flex-col h-[250px] shadow-xl overflow-hidden">
+                    <div className="p-3 border-b border-slate-800 text-[9px] font-black uppercase tracking-widest text-slate-500 bg-slate-800/50">Secure Comms</div>
                     <div className="flex-grow overflow-y-auto p-4 space-y-3">
                         {messages.map((m, i) => (
                             <div key={i} className={`flex flex-col ${m.player_name === playerName ? 'items-end' : 'items-start'}`}>
@@ -451,10 +475,10 @@ export default function Home() {
 
       {/* MOBILE NAV */}
       {lobbyInfo && lobbyInfo.status === 'playing' && (
-        <nav className="lg:hidden h-20 bg-slate-900 border-t border-slate-800 grid grid-cols-3 items-center z-50">
-          <button onClick={() => setMobileTab('board')} className={`flex flex-col items-center gap-1 ${mobileTab === 'board' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl">◫</span><span className="text-[9px] font-black uppercase tracking-widest">Grid</span></button>
-          <button onClick={() => setMobileTab('market')} className={`flex flex-col items-center gap-1 ${mobileTab === 'market' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl">＄</span><span className="text-[9px] font-black uppercase tracking-widest">Market</span></button>
-          <button onClick={() => setMobileTab('chat')} className={`flex flex-col items-center gap-1 ${mobileTab === 'chat' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl">💬</span><span className="text-[9px] font-black uppercase tracking-widest">Comms</span></button>
+        <nav className="lg:hidden h-20 bg-slate-900 border-t border-slate-800 grid grid-cols-3 items-center z-50 fixed bottom-0 left-0 right-0">
+          <button onClick={() => setMobileTab('board')} className={`flex flex-col items-center gap-1 ${mobileTab === 'board' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">◫</span><span className="text-[9px] font-black uppercase tracking-widest">Grid</span></button>
+          <button onClick={() => setMobileTab('market')} className={`flex flex-col items-center gap-1 ${mobileTab === 'market' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">＄</span><span className="text-[9px] font-black uppercase tracking-widest">Market</span></button>
+          <button onClick={() => setMobileTab('chat')} className={`flex flex-col items-center gap-1 ${mobileTab === 'chat' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">💬</span><span className="text-[9px] font-black uppercase tracking-widest">Comms</span></button>
         </nav>
       )}
     </main>
