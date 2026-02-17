@@ -90,19 +90,39 @@ export default function Home() {
 
   const peerInstance = useRef<Peer | null>(null);
 
+  // --- HARDENED REALTIME SYNC ---
   useEffect(() => {
     if (!lobbyInfo) return;
+
     const fetchData = async () => {
-      const { data: p } = await supabase.from('players').select('*').eq('lobby_id', lobbyInfo.id).order('play_order', { ascending: true, nullsFirst: false });
-      const { data: l } = await supabase.from('lobbies').select('*').eq('id', lobbyInfo.id).single();
+      const { data: p } = await supabase
+        .from('players')
+        .select('*')
+        .eq('lobby_id', lobbyInfo.id)
+        .order('play_order', { ascending: true, nullsFirst: false });
+      
+      const { data: l } = await supabase
+        .from('lobbies')
+        .select('*')
+        .eq('id', lobbyInfo.id)
+        .single();
+        
       if (p) setPlayers(p as Player[]);
       if (l) setLobbyInfo(l as Lobby);
     };
+
     fetchData();
+
     const channel = supabase.channel(`sync-${lobbyInfo.id}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'lobbies', filter: `id=eq.${lobbyInfo.id}` }, () => fetchData())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'players', filter: `lobby_id=eq.${lobbyInfo.id}` }, () => fetchData())
-      .subscribe();
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'players', filter: `lobby_id=eq.${lobbyInfo.id}` }, () => {
+        console.log("New Agent Detected on the Wire...");
+        fetchData();
+      })
+      .subscribe((status) => {
+        console.log("Syndicate Sync Status:", status);
+      });
+
     return () => { supabase.removeChannel(channel); };
   }, [lobbyInfo?.id]);
 
@@ -157,7 +177,6 @@ export default function Home() {
     }
   };
 
-  // --- RECTIFIED CORE LOGIC ---
   const handlePlaceTile = async (tile: string) => {
     if (!lobbyInfo || !me) return;
     const col = parseInt(tile.match(/\d+/)?.[0] || '0');
@@ -218,22 +237,14 @@ export default function Home() {
     }).eq('id', lobbyInfo.id);
   };
 
-  // --- RECTIFIED BUY LOGIC ---
   const handleBuyStock = async (corp: string) => {
     if (!lobbyInfo || !me) return;
-    
     const size = lobbyInfo.chain_sizes[corp] || 0;
     const price = getStockPrice(corp, size);
     const available = lobbyInfo.available_stocks[corp] || 0;
-    
     if (me.money < price || stocksBoughtThisTurn >= 3 || available <= 0) return;
-    
     const updatedStocks = { ...(me.stocks || {}), [corp]: ((me.stocks || {})[corp] || 0) + 1 };
-    
-    // UI Local State Update
     setStocksBoughtThisTurn(prev => prev + 1);
-
-    // Database Sync
     await supabase.from('players').update({ money: me.money - price, stocks: updatedStocks }).eq('id', me.id);
     await supabase.from('lobbies').update({ available_stocks: { ...lobbyInfo.available_stocks, [corp]: available - 1 } }).eq('id', lobbyInfo.id);
   };
@@ -253,9 +264,7 @@ export default function Home() {
     if (nextIdx === lobbyInfo.current_turn_index) {
         const updatedOwnership = { ...lobbyInfo.tile_ownership };
         Object.keys(updatedOwnership).forEach(k => { if (updatedOwnership[k] === current_defunct) updatedOwnership[k] = survivor!; });
-        
         const remainingDefuncts = defunct_corps?.filter(c => c !== current_defunct) || [];
-        
         if (remainingDefuncts.length > 0) {
             await distributeBonuses(remainingDefuncts[0], lobbyInfo.chain_sizes[remainingDefuncts[0]]);
             await supabase.from('lobbies').update({ 
@@ -284,10 +293,7 @@ export default function Home() {
     const pool = [...lobbyInfo.tile_pool];
     const hand = [...me.hand];
     if (pool.length > 0) hand.push(pool.pop()!);
-    
-    // RESET PURCHASE COUNTER
     setStocksBoughtThisTurn(0);
-    
     const activePlayers = players.filter(p => !p.is_spectator);
     await supabase.from('players').update({ hand }).eq('id', me.id);
     await supabase.from('lobbies').update({ 
@@ -304,7 +310,6 @@ export default function Home() {
     }
     const { data: finalP } = await supabase.from('players').select('*').eq('lobby_id', lobbyInfo.id);
     if (!finalP) return;
-
     for (let p of finalP) {
       let finalCash = p.money;
       CORPORATIONS.forEach(c => {
@@ -323,13 +328,43 @@ export default function Home() {
     if (l) { await supabase.from('players').insert([{ lobby_id: l.id, player_name: playerName, is_host: true, money: 6000, stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), hand: [] }]); setLobbyInfo(l as Lobby); setIsHost(true); }
   };
 
+  // --- RECTIFIED JOIN LOGIC ---
   const handleJoinLobby = async (e: any) => {
-    e.preventDefault(); if (!playerName || !joinCodeInput) return;
-    const { data: l } = await supabase.from('lobbies').select('*').eq('join_code', joinCodeInput.toUpperCase()).single();
+    e.preventDefault(); 
+    if (!playerName || !joinCodeInput) return;
+
+    // 1. Find the Lobby
+    const { data: l } = await supabase
+      .from('lobbies')
+      .select('*')
+      .eq('join_code', joinCodeInput.toUpperCase())
+      .single();
+
     if (l) {
-      const { count } = await supabase.from('players').select('*', { count: 'exact', head: true }).eq('lobby_id', l.id);
-      await supabase.from('players').insert([{ lobby_id: l.id, player_name: playerName, is_host: false, is_spectator: (count || 0) >= 6, money: 6000, stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), hand: [] }]);
-      setLobbyInfo(l as Lobby);
+      // 2. Check current count to handle spectator mode automatically
+      const { count } = await supabase
+        .from('players')
+        .select('*', { count: 'exact', head: true })
+        .eq('lobby_id', l.id);
+
+      // 3. Infiltrate the Player Table
+      const { error } = await supabase.from('players').insert([{ 
+        lobby_id: l.id, 
+        player_name: playerName, 
+        is_host: false, 
+        is_spectator: (count || 0) >= 6, 
+        money: 6000, 
+        stocks: CORPORATIONS.reduce((a,c)=>({...a,[c]:0}),{}), 
+        hand: [] 
+      }]);
+
+      if (!error) {
+        setLobbyInfo(l as Lobby);
+      } else {
+        alert("Encryption Error: Could not join lobby.");
+      }
+    } else {
+      alert("Invalid Join Code. The Syndicate does not recognize this frequency.");
     }
   };
 
