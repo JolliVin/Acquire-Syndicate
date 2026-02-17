@@ -77,7 +77,6 @@ export default function Home() {
   const [lobbyInfo, setLobbyInfo] = useState<Lobby | null>(null);
   const [players, setPlayers] = useState<Player[]>([]);
   const [isHost, setIsHost] = useState(false);
-  const [isStarting, setIsStarting] = useState(false);
   const [isMicActive, setIsMicActive] = useState(false);
   const [stocksBoughtThisTurn, setStocksBoughtThisTurn] = useState(0);
 
@@ -100,32 +99,7 @@ export default function Home() {
     return () => { supabase.removeChannel(channel); };
   }, [lobbyInfo?.id]);
 
-  // --- VOICE ---
   const me = players.find(p => p.player_name === playerName);
-  useEffect(() => {
-    if (!me?.id || typeof window === 'undefined') return;
-    const peer = new Peer(me.id.replace(/-/g, ''));
-    peerInstance.current = peer;
-    peer.on('call', (call) => {
-      navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-        call.answer(stream);
-        call.on('stream', (rms) => { const a = new Audio(); a.srcObject = rms; a.play(); });
-      });
-    });
-    return () => peer.destroy();
-  }, [me?.id]);
-
-  const toggleVoice = async () => {
-    if (isMicActive) { peerInstance.current?.destroy(); setIsMicActive(false); return; }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setIsMicActive(true);
-      players.filter(p => p.id !== me?.id && !p.is_spectator).forEach(player => {
-        const call = peerInstance.current?.call(player.id.replace(/-/g, ''), stream);
-        call?.on('stream', (rms) => { const a = new Audio(); a.srcObject = rms; a.play(); });
-      });
-    } catch (err) { alert("Mic Access Denied."); }
-  };
 
   // --- LOBBY ACTIONS ---
   const handleCreateLobby = async (e: React.FormEvent) => {
@@ -155,7 +129,6 @@ export default function Home() {
   const handleStartGame = async () => {
     const active = players.filter(p => !p.is_spectator);
     if (!lobbyInfo || active.length < 3) return;
-    setIsStarting(true);
     let pool: string[] = [];
     for (let r of BOARD_ROWS) for (let c of BOARD_COLS) pool.push(`${c}${r}`);
     pool = pool.sort(() => Math.random() - 0.5);
@@ -166,24 +139,20 @@ export default function Home() {
       await supabase.from('players').update({ starting_tile: res.tile, play_order: i, hand: pool.splice(-6) }).eq('id', res.id);
     }
     await supabase.from('lobbies').update({ status: 'playing', board_state: drawResults.map(r => r.tile), tile_pool: pool, turn_phase: 'place_tile', current_turn_index: 0, tile_ownership: drawResults.reduce((acc, r) => ({ ...acc, [r.tile]: null }), {}) }).eq('id', lobbyInfo.id);
-    setIsStarting(false);
   };
 
-  // --- MERGER BONUS LOGIC ---
+  // --- MERGER PAYOUT LOGIC ---
   const distributeMergerBonuses = async (defunct: string, size: number) => {
     if (!lobbyInfo) return;
     const price = getStockPrice(defunct, size);
     const majorityBonus = price * 10;
     const minorityBonus = price * 5;
-
     const ranked = [...players].filter(p => !p.is_spectator).sort((a, b) => (b.stocks[defunct] || 0) - (a.stocks[defunct] || 0));
     const counts = ranked.map(p => p.stocks[defunct] || 0);
     const max = counts[0];
     if (max === 0) return;
-
     const firstPlacePlayers = ranked.filter(p => (p.stocks[defunct] || 0) === max);
     let updates = [];
-
     if (firstPlacePlayers.length > 1) {
       const split = (majorityBonus + minorityBonus) / firstPlacePlayers.length;
       updates = firstPlacePlayers.map(p => ({ id: p.id, money: p.money + split }));
@@ -195,27 +164,25 @@ export default function Home() {
         const secondPlacePlayers = remaining.filter(p => p.stocks[defunct] === secondMax);
         const splitMinority = minorityBonus / secondPlacePlayers.length;
         secondPlacePlayers.forEach(p => updates.push({ id: p.id, money: p.money + splitMinority }));
-      } else {
-        updates[0].money += minorityBonus;
-      }
+      } else { updates[0].money += minorityBonus; }
     }
-
-    for (const up of updates) {
-      await supabase.from('players').update({ money: up.money }).eq('id', up.id);
-    }
+    for (const up of updates) { await supabase.from('players').update({ money: up.money }).eq('id', up.id); }
   };
 
-  // --- GAME ACTIONS ---
-  const getNeighbors = (t: string) => {
-    const c = parseInt(t.match(/\d+/)?.[0] || '0');
-    const r = BOARD_ROWS.indexOf(t.match(/[A-I]/)?.[0] || 'A');
-    return [`${c-1}${BOARD_ROWS[r]}`, `${c+1}${BOARD_ROWS[r]}`, `${c}${BOARD_ROWS[r-1]}`, `${c}${BOARD_ROWS[r+1]}`];
-  };
-
+  // --- GAMEPLAY HANDLERS ---
   const handlePlaceTile = async (tile: string) => {
     const cur = players.find(p => p.play_order === lobbyInfo?.current_turn_index);
     if (!lobbyInfo || !cur || cur.player_name !== playerName) return;
-    const adj = getNeighbors(tile).filter(n => lobbyInfo.board_state.includes(n));
+    
+    // Neighbor Detection Logic
+    const col = parseInt(tile.match(/\d+/)?.[0] || '0');
+    const row = tile.match(/[A-I]/)?.[0] || 'A';
+    const adj = [
+      `${col-1}${row}`, `${col+1}${row}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0)-1)}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0)+1)}`
+    ].filter(n => lobbyInfo.board_state.includes(n));
+    
     const corps = Array.from(new Set(adj.map(n => lobbyInfo.tile_ownership[n]).filter((c): c is string => !!c)));
     
     let next = 'buy_stocks'; let mData: MergerData = {};
@@ -223,15 +190,11 @@ export default function Home() {
       next = 'merger_resolution';
       const sorted = [...corps].sort((a,b) => (lobbyInfo.chain_sizes[b] || 0) - (lobbyInfo.chain_sizes[a] || 0));
       const tied = sorted.filter(c => lobbyInfo.chain_sizes[c] === lobbyInfo.chain_sizes[sorted[0]]);
-      
       if (tied.length === 1) {
-        const survivor = sorted[0];
-        const defuncts = corps.filter(c => c !== survivor);
+        const survivor = sorted[0]; const defuncts = corps.filter(c => c !== survivor);
         for (const d of defuncts) { await distributeMergerBonuses(d, lobbyInfo.chain_sizes[d]); }
         mData = { survivor, current_defunct: defuncts[0], defunct_corps: defuncts, tile_placed: tile };
-      } else {
-        mData = { is_tied: true, potential_survivors: tied, defunct_corps: corps, tile_placed: tile };
-      }
+      } else { mData = { is_tied: true, potential_survivors: tied, defunct_corps: corps, tile_placed: tile }; }
     }
     else if (corps.length === 0 && adj.length > 0) next = 'found_chain';
     else if (corps.length === 1) {
@@ -243,10 +206,18 @@ export default function Home() {
   };
 
   const handleFoundChain = async (corp: string) => {
+    // Renegade Rules: 1 FREE Bonus Stock for Founder
+    const founder = players.find(p => p.play_order === lobbyInfo!.current_turn_index);
+    if (!founder) return;
+    await supabase.from('players').update({ stocks: { ...founder.stocks, [corp]: (founder.stocks[corp] || 0) + 1 } }).eq('id', founder.id);
     const last = lobbyInfo!.board_state[lobbyInfo!.board_state.length - 1];
-    const tiles = [last, ...getNeighbors(last).filter(n => lobbyInfo!.board_state.includes(n) && !lobbyInfo!.tile_ownership[n])];
-    const ownership = { ...lobbyInfo!.tile_ownership }; tiles.forEach(t => ownership[t] = corp);
-    await supabase.from('lobbies').update({ tile_ownership: ownership, active_chains: [...lobbyInfo!.active_chains, corp], chain_sizes: { ...lobbyInfo!.chain_sizes, [corp]: tiles.length }, turn_phase: 'buy_stocks' }).eq('id', lobbyInfo!.id);
+    const updatedOwnership = { ...lobbyInfo!.tile_ownership, [last]: corp };
+    await supabase.from('lobbies').update({ 
+      tile_ownership: updatedOwnership, active_chains: [...lobbyInfo!.active_chains, corp], 
+      chain_sizes: { ...lobbyInfo!.chain_sizes, [corp]: 2 }, 
+      available_stocks: { ...lobbyInfo!.available_stocks, [corp]: lobbyInfo!.available_stocks[corp] - 1 },
+      turn_phase: 'buy_stocks' 
+    }).eq('id', lobbyInfo!.id);
   };
 
   const handleDisposition = async (action: 'sell' | 'trade' | 'keep') => {
@@ -269,7 +240,7 @@ export default function Home() {
   const handleBuyStock = async (corp: string) => {
     const cur = players.find(p => p.play_order === lobbyInfo?.current_turn_index);
     const price = getStockPrice(corp, lobbyInfo!.chain_sizes[corp]);
-    if (!cur || cur.money < price || stocksBoughtThisTurn >= 3) return;
+    if (!cur || cur.money < price || stocksBoughtThisTurn >= 3 || (lobbyInfo!.available_stocks[corp] || 0) <= 0) return;
     setStocksBoughtThisTurn(prev => prev + 1);
     await supabase.from('players').update({ money: cur.money - price, stocks: { ...cur.stocks, [corp]: (cur.stocks[corp] || 0) + 1 }}).eq('id', cur.id);
     await supabase.from('lobbies').update({ available_stocks: { ...lobbyInfo!.available_stocks, [corp]: lobbyInfo!.available_stocks[corp] - 1 }}).eq('id', lobbyInfo!.id);
@@ -285,17 +256,13 @@ export default function Home() {
   };
 
   // --- UI RENDER ---
-  const totalStockValue = me ? CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, lobbyInfo?.chain_sizes[c] || 0)), 0) : 0;
-  const netWorth = (me?.money || 0) + totalStockValue;
+  const netWorth = me ? (me.money + CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, lobbyInfo?.chain_sizes[c] || 0)), 0)) : 0;
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase">
       <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center sticky top-0 z-40">
-        <h1 className="text-xl font-black text-amber-500 italic tracking-tighter">Acquire Syndicate</h1>
-        <div className="flex gap-2">
-           <button onClick={toggleVoice} className={`text-[10px] px-3 py-1.5 rounded-full border transition-all ${isMicActive ? 'bg-emerald-500 text-black animate-pulse font-bold' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
-              {isMicActive ? '🎙 COMMS LIVE' : '🎤 MIC ON'}
-           </button>
+        <h1 className="text-xl font-black text-amber-500 italic tracking-tighter uppercase">Acquire Syndicate</h1>
+        <div className="flex gap-2 items-center">
            {lobbyInfo && <span className="text-[10px] font-mono bg-amber-500/10 text-amber-500 px-3 py-1.5 rounded-full border border-amber-500/20">{lobbyInfo.join_code}</span>}
         </div>
       </header>
@@ -310,13 +277,13 @@ export default function Home() {
                         <input type="text" maxLength={10} value={playerName} onChange={e => setPlayerName(e.target.value)} className="bg-slate-800 p-4 rounded-xl outline-none border border-slate-700 focus:border-amber-500" placeholder="Agent Alias"/>
                         {view === 'home' ? (
                           <>
-                            <button onClick={() => setView('create')} className="bg-amber-500 text-black font-black py-4 rounded-xl hover:bg-white transition-all">Establish Syndicate</button>
-                            <button onClick={() => setView('join')} className="border-2 border-amber-500 text-amber-500 font-black py-4 rounded-xl hover:bg-amber-500/10">Infiltrate</button>
+                            <button onClick={() => setView('create')} className="bg-amber-500 text-black font-black py-4 rounded-xl">Establish Syndicate</button>
+                            <button onClick={() => setView('join')} className="border-2 border-amber-500 text-amber-500 font-black py-4 rounded-xl">Infiltrate</button>
                           </>
                         ) : (
                           <>
                             {view === 'join' && <input type="text" maxLength={6} value={joinCodeInput} onChange={e => setJoinCodeInput(e.target.value.toUpperCase())} className="bg-slate-800 p-4 rounded-xl text-center font-mono tracking-widest" placeholder="XXXXXX"/>}
-                            <button onClick={view === 'create' ? handleCreateLobby : handleJoinLobby} className="bg-amber-500 text-black font-black py-4 rounded-xl">CONFIRM</button>
+                            <button onClick={view === 'create' ? handleCreateLobby : handleJoinLobby} className="bg-amber-500 text-black font-black py-4 rounded-xl uppercase">Confirm</button>
                             <button onClick={() => setView('home')} className="text-[10px] text-slate-500 font-black mt-2">Back</button>
                           </>
                         )}
@@ -326,24 +293,26 @@ export default function Home() {
                    <div>
                       <h2 className="text-5xl font-mono font-black text-amber-400 mb-8 tracking-tighter">{lobbyInfo.join_code}</h2>
                       <div className="bg-slate-900 p-6 rounded-3xl mb-6 shadow-xl border border-slate-800 w-80 mx-auto">
-                         <div className="text-[10px] text-slate-500 mb-4 font-black tracking-widest uppercase">Active Agents ({players.length}/6)</div>
+                         <div className="text-[10px] text-slate-500 mb-4 tracking-widest">Active Agents ({players.length}/6)</div>
                          <div className="space-y-2">
                            {players.map(p => <div key={p.id} className="py-2 px-4 bg-slate-800/50 rounded-xl flex justify-between items-center text-sm font-bold border border-slate-700/50"><span>{p.player_name}</span>{p.is_host && <span className="text-amber-500 text-xs font-black">HOST</span>}</div>)}
                          </div>
                       </div>
-                      {isHost && players.length >= 3 && <button onClick={handleStartGame} className="bg-emerald-500 px-12 py-4 rounded-2xl font-black shadow-lg hover:scale-105 transition-all text-white tracking-widest uppercase">Initiate Operation</button>}
+                      {isHost && players.length >= 3 && <button onClick={handleStartGame} className="bg-emerald-500 px-12 py-4 rounded-2xl font-black shadow-lg text-white tracking-widest uppercase">Initiate Operation</button>}
                    </div>
                 )}
              </div>
           ) : (
             <>
               {/* BOARD */}
-              <div className={`lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-3xl border border-slate-800 overflow-auto ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'} flex-col relative`}>
+              <div className="lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-3xl border border-slate-800 overflow-auto flex flex-col relative">
                 
+                {/* FOUNDATION MODAL */}
                 {lobbyInfo.turn_phase === 'found_chain' && players.find(p => p.play_order === lobbyInfo.current_turn_index)?.player_name === playerName && (
                     <div className="absolute inset-0 z-50 bg-slate-950/90 flex items-center justify-center p-6 backdrop-blur-sm">
                         <div className="text-center bg-slate-900 p-8 rounded-3xl border border-amber-500 shadow-2xl">
-                            <h2 className="text-xl font-black text-amber-400 mb-6 tracking-widest">Found Corporation</h2>
+                            <h2 className="text-xl font-black text-amber-400 mb-2 tracking-widest uppercase">Found Corporation</h2>
+                            <p className="text-[10px] text-slate-500 mb-6 font-bold uppercase tracking-widest">Receive 1 Bonus Stock + Buy Up to 3</p>
                             <div className="grid grid-cols-2 gap-2">
                                 {CORPORATIONS.filter(c => !lobbyInfo.active_chains.includes(c)).map(corp => (
                                     <button key={corp} onClick={() => handleFoundChain(corp)} className={`${CORP_METADATA[corp].bg} ${CORP_METADATA[corp].text} p-4 rounded-xl font-black text-xs`}>{corp}</button>
@@ -353,10 +322,11 @@ export default function Home() {
                     </div>
                 )}
 
+                {/* MERGER MODAL */}
                 {lobbyInfo.turn_phase === 'merger_resolution' && players.find(p => p.play_order === lobbyInfo.disposition_turn_index)?.player_name === playerName && (
                     <div className="absolute inset-0 z-50 bg-slate-950/90 flex items-center justify-center p-6 backdrop-blur-sm">
                         <div className="bg-slate-900 border-2 border-emerald-500 p-8 rounded-3xl text-center max-w-sm w-full shadow-2xl">
-                            <h2 className="text-xl font-black text-emerald-400 mb-2">Merger Disposition</h2>
+                            <h2 className="text-xl font-black text-emerald-400 mb-2 uppercase">Merger Disposition</h2>
                             <p className="text-[10px] text-slate-500 mb-6 uppercase tracking-widest">{lobbyInfo.merger_data.current_defunct} → {lobbyInfo.merger_data.survivor}</p>
                             <div className="flex flex-col gap-3">
                                 <button onClick={() => handleDisposition('sell')} className="bg-white text-black font-black py-4 rounded-xl">SELL ALL</button>
@@ -382,56 +352,53 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* SIDEBAR */}
-              <div className={`lg:col-span-4 flex flex-col gap-4 ${mobileTab !== 'market' ? 'hidden lg:flex' : 'flex'} overflow-y-auto pb-20 lg:pb-0`}>
-                 <div className="bg-slate-900/50 p-4 rounded-2xl border border-slate-800">
-                    <h3 className="text-[10px] font-black text-slate-500 mb-3 tracking-widest uppercase">Initial Draw Ceremony</h3>
-                    <div className="space-y-2">
-                       {players.map(p => (
-                          <div key={p.id} className={`flex justify-between items-center px-3 py-2 rounded-lg border ${p.play_order === lobbyInfo.current_turn_index ? 'border-amber-500 bg-amber-500/10' : 'border-slate-800 bg-slate-900/50'}`}>
-                             <div className="flex items-center gap-3">
-                                <span className="text-[10px] font-mono text-slate-500">#{p.play_order! + 1}</span>
-                                <span className="text-xs font-bold">{p.player_name}</span>
+              {/* SIDEBAR: PRIVATE LEDGER */}
+              <div className="lg:col-span-4 flex flex-col gap-4 overflow-y-auto">
+                 <div className="bg-slate-900 p-6 rounded-3xl border border-amber-500/30 shadow-2xl relative overflow-hidden group">
+                    <h3 className="text-[10px] font-black text-slate-500 mb-4 tracking-widest uppercase border-b border-slate-800 pb-2">Confidential Ledger</h3>
+                    <div className="flex justify-between items-end mb-6">
+                       <div>
+                          <p className="text-[9px] text-slate-500 font-bold uppercase tracking-tighter">Liquid Cash</p>
+                          <p className="text-3xl font-black text-emerald-400 font-mono tracking-tighter">${me?.money.toLocaleString()}</p>
+                       </div>
+                       <div className="text-right">
+                          <p className="text-[9px] text-slate-500 font-bold uppercase tracking-tighter">Net Worth</p>
+                          <p className="text-sm font-bold font-mono text-slate-100">${netWorth.toLocaleString()}</p>
+                       </div>
+                    </div>
+                    {/* Private Stocks List */}
+                    <div className="space-y-1">
+                       {CORPORATIONS.map(corp => (
+                          <div key={corp} className={`flex justify-between items-center p-2 rounded-lg bg-slate-800/50 border border-slate-700/50 ${me?.stocks[corp] ? 'opacity-100' : 'opacity-20 grayscale'}`}>
+                             <div className="flex items-center gap-2">
+                                <div className={`w-2 h-2 rounded-full ${CORP_METADATA[corp].bg}`}></div>
+                                <span className="text-[10px] font-black">{corp}</span>
                              </div>
-                             <span className="text-[10px] font-black bg-slate-800 px-2 py-1 rounded text-amber-500 font-mono">{p.starting_tile}</span>
+                             <span className="text-xs font-mono font-bold text-amber-500">{me?.stocks[corp] || 0} Shares</span>
                           </div>
                        ))}
                     </div>
                  </div>
 
-                 <div className="bg-slate-900 p-6 rounded-3xl border border-amber-500/30 shadow-2xl relative overflow-hidden group">
-                    <h3 className="text-[10px] font-black text-slate-500 mb-4 tracking-widest uppercase">Portfolio</h3>
-                    <div className="flex justify-between items-end">
-                       <div>
-                          <p className="text-[9px] text-slate-500 font-bold tracking-tight uppercase">Net Worth</p>
-                          <p className="text-3xl font-black text-emerald-400 font-mono tracking-tighter">${netWorth.toLocaleString()}</p>
-                       </div>
-                       <div className="text-right">
-                          <p className="text-[9px] text-slate-500 font-bold tracking-tight uppercase">Liquid Cash</p>
-                          <p className="text-sm font-bold font-mono text-slate-100">${me?.money.toLocaleString()}</p>
-                       </div>
-                    </div>
-                 </div>
-
                  <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 shadow-xl flex-grow">
-                    <h3 className="text-[10px] font-black text-slate-500 mb-4 tracking-widest uppercase">Market Exchange</h3>
+                    <h3 className="text-[10px] font-black text-slate-500 mb-4 tracking-widest uppercase">Exchange</h3>
                     <table className="w-full text-left">
                        <tbody className="text-xs">
                           {CORPORATIONS.map(corp => {
                              const size = lobbyInfo.chain_sizes[corp] || 0;
                              const price = getStockPrice(corp, size);
-                             const isSoldOut = (lobbyInfo.available_stocks[corp] || 0) <= 0;
+                             const stocksLeft = lobbyInfo.available_stocks[corp] || 0;
                              const isTurn = lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks';
                              return (
-                                <tr key={corp} className={`border-b border-slate-800/50 last:border-0 ${isSoldOut ? 'opacity-40 grayscale' : ''}`}>
+                                <tr key={corp} className={`border-b border-slate-800/50 last:border-0 ${stocksLeft <= 0 ? 'opacity-30 grayscale' : ''}`}>
                                    <td className="py-3 flex items-center gap-2 font-bold">
                                       <div className={`w-2 h-2 rounded-full ${CORP_METADATA[corp].bg}`}></div>
-                                      <span className={isSoldOut ? 'line-through text-slate-500' : ''}>{corp}</span>
+                                      <span>{corp}</span>
                                    </td>
-                                   <td className="py-3 font-mono text-emerald-400 font-bold">${price}</td>
+                                   <td className="py-3 font-mono text-emerald-400 font-bold text-right">${price}</td>
                                    <td className="py-3 text-right">
-                                      {!isSoldOut && (
-                                         <button onClick={() => handleBuyStock(corp)} disabled={!isTurn || stocksBoughtThisTurn >= 3 || (me?.money || 0) < price} className="bg-amber-500 text-black px-3 py-1 rounded-lg text-[10px] font-black hover:bg-white disabled:opacity-10 shadow-sm uppercase">BUY</button>
+                                      {stocksLeft > 0 && (
+                                         <button onClick={() => handleBuyStock(corp)} disabled={!isTurn || stocksBoughtThisTurn >= 3 || (me?.money || 0) < price} className="bg-amber-500 text-black px-2 py-1 rounded text-[9px] font-black disabled:opacity-0 uppercase">Buy</button>
                                       )}
                                    </td>
                                 </tr>
@@ -440,7 +407,10 @@ export default function Home() {
                        </tbody>
                     </table>
                     {lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks' && (
-                       <button onClick={handleEndTurn} className="w-full mt-4 bg-emerald-600 py-3 rounded-xl font-black text-sm tracking-widest shadow-lg uppercase">End Turn</button>
+                       <div className="mt-4 space-y-2">
+                          <p className="text-[8px] text-center font-bold text-slate-500 uppercase tracking-widest">Buys: {stocksBoughtThisTurn}/3</p>
+                          <button onClick={handleEndTurn} className="w-full bg-emerald-600 py-3 rounded-xl font-black text-sm tracking-widest shadow-lg uppercase">End Turn</button>
+                       </div>
                     )}
                  </div>
               </div>
@@ -448,13 +418,6 @@ export default function Home() {
           )}
         </div>
       </div>
-
-      {lobbyInfo && lobbyInfo.status === 'playing' && (
-        <nav className="lg:hidden h-20 bg-slate-900 border-t border-slate-800 grid grid-cols-2 items-center z-50 fixed bottom-0 left-0 right-0">
-          <button onClick={() => setMobileTab('board')} className={`flex flex-col items-center gap-1 ${mobileTab === 'board' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">◫</span><span className="text-[9px] font-black uppercase tracking-widest">Grid</span></button>
-          <button onClick={() => setMobileTab('market')} className={`flex flex-col items-center gap-1 ${mobileTab === 'market' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">＄</span><span className="text-[9px] font-black uppercase tracking-widest">Market</span></button>
-        </nav>
-      )}
     </main>
   );
 }
