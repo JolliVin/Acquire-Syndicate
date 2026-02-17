@@ -90,7 +90,6 @@ export default function Home() {
 
   const peerInstance = useRef<Peer | null>(null);
 
-  // --- DATA SYNC ---
   useEffect(() => {
     if (!lobbyInfo) return;
     const fetchData = async () => {
@@ -109,7 +108,6 @@ export default function Home() {
 
   const me = players.find(p => p.player_name === playerName);
 
-  // --- COMMS ---
   useEffect(() => {
     if (!me?.id || typeof window === 'undefined') return;
     const peer = new Peer(me.id.replace(/-/g, ''));
@@ -135,26 +133,28 @@ export default function Home() {
     } catch (err) { alert("Mic Access Denied."); }
   };
 
-  // --- PAYOUT ENGINE ---
-  const distributeBonuses = async (defunct: string, size: number) => {
-    const price = getStockPrice(defunct, size);
+  const distributeBonuses = async (corp: string, size: number) => {
+    const price = getStockPrice(corp, size);
     const majority = price * 10;
     const minority = price * 5;
-    const ranked = [...players].filter(p => !p.is_spectator).sort((a, b) => (b.stocks[defunct] || 0) - (a.stocks[defunct] || 0));
-    const counts = ranked.map(p => p.stocks[defunct] || 0);
+    const ranked = [...players].filter(p => !p.is_spectator).sort((a, b) => (b.stocks[corp] || 0) - (a.stocks[corp] || 0));
+    const counts = ranked.map(p => p.stocks[corp] || 0);
     if (counts[0] === 0) return;
 
-    const firsts = ranked.filter(p => (p.stocks[defunct] || 0) === counts[0]);
+    const firsts = ranked.filter(p => (p.stocks[corp] || 0) === counts[0]);
     if (firsts.length > 1) {
       const split = (majority + minority) / firsts.length;
       for (let p of firsts) await supabase.from('players').update({ money: p.money + split }).eq('id', p.id);
     } else {
       await supabase.from('players').update({ money: firsts[0].money + majority }).eq('id', firsts[0].id);
-      const seconds = ranked.filter(p => (p.stocks[defunct] || 0) === counts.find(c => c < counts[0] && c > 0));
+      const seconds = ranked.filter(p => (p.stocks[corp] || 0) === counts.find(c => c < counts[0] && c > 0));
       if (seconds.length > 0) {
         const splitMinority = minority / seconds.length;
         for (let p of seconds) await supabase.from('players').update({ money: p.money + splitMinority }).eq('id', p.id);
-      } else { await supabase.from('players').update({ money: firsts[0].money + majority + minority }).eq('id', firsts[0].id); }
+      } else { 
+        // Minority goes to Majority if only one player has stocks
+        await supabase.from('players').update({ money: firsts[0].money + majority + minority }).eq('id', firsts[0].id); 
+      }
     }
   };
 
@@ -171,18 +171,21 @@ export default function Home() {
 
     if (neighboringCorps.length > 1) {
       nextPhase = 'merger_resolution';
-      const sorted = [...neighboringCorps].sort((a,b) => lobbyInfo.chain_sizes[b] - lobbyInfo.chain_sizes[a]);
+      const sorted = [...neighboringCorps].sort((a,b) => (lobbyInfo.chain_sizes[b] || 0) - (lobbyInfo.chain_sizes[a] || 0));
       const survivor = sorted[0];
-      const defuncts = neighboringCorps.filter(c => c !== survivor);
-      // Trigger Payouts for the first defunct corp immediately
+      const defuncts = sorted.slice(1);
       await distributeBonuses(defuncts[0], lobbyInfo.chain_sizes[defuncts[0]]);
       mData = { survivor, current_defunct: defuncts[0], defunct_corps: defuncts, tile_placed: tile };
     } 
     else if (neighboringCorps.length === 1) {
       const survivor = neighboringCorps[0];
+      const unincorporatedAdj = adj.filter(n => !lobbyInfo.tile_ownership[n]);
+      const newOwnership = { ...lobbyInfo.tile_ownership, [tile]: survivor };
+      unincorporatedAdj.forEach(t => { newOwnership[t] = survivor; });
+
       await supabase.from('lobbies').update({ 
-        chain_sizes: { ...lobbyInfo.chain_sizes, [survivor]: lobbyInfo.chain_sizes[survivor] + 1 },
-        tile_ownership: { ...lobbyInfo.tile_ownership, [tile]: survivor }
+        chain_sizes: { ...lobbyInfo.chain_sizes, [survivor]: (lobbyInfo.chain_sizes[survivor] || 0) + 1 + unincorporatedAdj.length },
+        tile_ownership: newOwnership
       }).eq('id', lobbyInfo.id);
     }
     else if (neighboringCorps.length === 0 && adj.length > 0 && lobbyInfo.active_chains.length < 7) {
@@ -195,21 +198,23 @@ export default function Home() {
 
   const handleFoundChain = async (corp: string) => {
     if (!lobbyInfo || !me) return;
+    const currentStocks = me.stocks || {};
+    const updatedStocks = { ...currentStocks, [corp]: (currentStocks[corp] || 0) + 1 };
     const lastTile = lobbyInfo.board_state[lobbyInfo.board_state.length - 1];
     const col = parseInt(lastTile.match(/\d+/)?.[0] || '0');
     const row = lastTile.match(/[A-I]/)?.[0] || 'A';
-    const adjTiles = [`${col-1}${row}`, `${col+1}${row}`, `${col}${String.fromCharCode(row.charCodeAt(0)-1)}`, `${col}${String.fromCharCode(row.charCodeAt(0)+1)}`].filter(n => lobbyInfo.board_state.includes(n) && !lobbyInfo.tile_ownership[n]);
+    const cluster = [`${col-1}${row}`, `${col+1}${row}`, `${col}${String.fromCharCode(row.charCodeAt(0)-1)}`, `${col}${String.fromCharCode(row.charCodeAt(0)+1)}`]
+      .filter(n => lobbyInfo.board_state.includes(n) && !lobbyInfo.tile_ownership[n]);
     
     const newOwnership = { ...lobbyInfo.tile_ownership };
-    [lastTile, ...adjTiles].forEach(t => { newOwnership[t] = corp; });
+    [lastTile, ...cluster].forEach(t => { newOwnership[t] = corp; });
 
-    const bonusStocks = { ...me.stocks, [corp]: (me.stocks[corp] || 0) + 1 };
-    await supabase.from('players').update({ stocks: bonusStocks }).eq('id', me.id);
+    await supabase.from('players').update({ stocks: updatedStocks }).eq('id', me.id);
     await supabase.from('lobbies').update({ 
       active_chains: [...lobbyInfo.active_chains, corp],
-      chain_sizes: { ...lobbyInfo.chain_sizes, [corp]: adjTiles.length + 1 },
+      chain_sizes: { ...lobbyInfo.chain_sizes, [corp]: cluster.length + 1 },
       tile_ownership: newOwnership,
-      available_stocks: { ...lobbyInfo.available_stocks, [corp]: lobbyInfo.available_stocks[corp] - 1 },
+      available_stocks: { ...lobbyInfo.available_stocks, [corp]: (lobbyInfo.available_stocks[corp] || 25) - 1 },
       turn_phase: 'buy_stocks'
     }).eq('id', lobbyInfo.id);
   };
@@ -217,35 +222,52 @@ export default function Home() {
   const handleBuyStock = async (corp: string) => {
     if (!lobbyInfo || !me) return;
     const price = getStockPrice(corp, lobbyInfo.chain_sizes[corp] || 0);
-    if (me.money < price || stocksBoughtThisTurn >= 3 || lobbyInfo.available_stocks[corp] <= 0) return;
+    if (me.money < price || stocksBoughtThisTurn >= 3 || (lobbyInfo.available_stocks[corp] || 0) <= 0) return;
+    const updatedStocks = { ...(me.stocks || {}), [corp]: ((me.stocks || {})[corp] || 0) + 1 };
     setStocksBoughtThisTurn(prev => prev + 1);
-    await supabase.from('players').update({ money: me.money - price, stocks: { ...me.stocks, [corp]: (me.stocks[corp] || 0) + 1 } }).eq('id', me.id);
+    await supabase.from('players').update({ money: me.money - price, stocks: updatedStocks }).eq('id', me.id);
     await supabase.from('lobbies').update({ available_stocks: { ...lobbyInfo.available_stocks, [corp]: (lobbyInfo.available_stocks[corp] || 0) - 1 } }).eq('id', lobbyInfo.id);
   };
 
   const handleDisposition = async (action: 'sell' | 'trade' | 'keep') => {
     if (!lobbyInfo || !me) return;
-    const defunct = lobbyInfo.merger_data.current_defunct!;
-    const survivor = lobbyInfo.merger_data.survivor!;
-    const count = me.stocks[defunct] || 0;
+    const { survivor, current_defunct, defunct_corps, tile_placed } = lobbyInfo.merger_data;
+    const count = me.stocks[current_defunct!] || 0;
     let m = me.money; let s = { ...me.stocks };
 
-    if (action === 'sell') { m += count * getStockPrice(defunct, lobbyInfo.chain_sizes[defunct]); s[defunct] = 0; }
-    else if (action === 'trade') { const pairs = Math.floor(count/2); s[defunct] -= pairs*2; s[survivor] = (s[survivor] || 0) + pairs; }
+    if (action === 'sell') { m += count * getStockPrice(current_defunct!, lobbyInfo.chain_sizes[current_defunct!]); s[current_defunct!] = 0; }
+    else if (action === 'trade') { const pairs = Math.floor(count/2); s[current_defunct!] -= pairs*2; s[survivor!] = (s[survivor!] || 0) + pairs; }
 
     const activePlayers = players.filter(p => !p.is_spectator);
     const nextIdx = (lobbyInfo.disposition_turn_index + 1) % activePlayers.length;
     
     if (nextIdx === lobbyInfo.current_turn_index) {
+        // Current defunct processing finished for all players
         const updatedOwnership = { ...lobbyInfo.tile_ownership };
-        Object.keys(updatedOwnership).forEach(k => { if (updatedOwnership[k] === defunct) updatedOwnership[k] = survivor; });
-        updatedOwnership[lobbyInfo.merger_data.tile_placed!] = survivor;
-        await supabase.from('lobbies').update({ 
-            turn_phase: 'buy_stocks', 
-            tile_ownership: updatedOwnership,
-            active_chains: lobbyInfo.active_chains.filter(c => c !== defunct),
-            chain_sizes: { ...lobbyInfo.chain_sizes, [survivor]: lobbyInfo.chain_sizes[survivor] + lobbyInfo.chain_sizes[defunct] + 1 }
-        }).eq('id', lobbyInfo.id);
+        Object.keys(updatedOwnership).forEach(k => { if (updatedOwnership[k] === current_defunct) updatedOwnership[k] = survivor!; });
+        
+        const remainingDefuncts = defunct_corps?.filter(c => c !== current_defunct) || [];
+        
+        if (remainingDefuncts.length > 0) {
+            // Move to next defunct in the merger
+            await distributeBonuses(remainingDefuncts[0], lobbyInfo.chain_sizes[remainingDefuncts[0]]);
+            await supabase.from('lobbies').update({ 
+                merger_data: { ...lobbyInfo.merger_data, current_defunct: remainingDefuncts[0], defunct_corps: remainingDefuncts },
+                disposition_turn_index: lobbyInfo.current_turn_index,
+                tile_ownership: updatedOwnership,
+                active_chains: lobbyInfo.active_chains.filter(c => c !== current_defunct),
+                chain_sizes: { ...lobbyInfo.chain_sizes, [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) }
+            }).eq('id', lobbyInfo.id);
+        } else {
+            // Merger complete
+            updatedOwnership[tile_placed!] = survivor!;
+            await supabase.from('lobbies').update({ 
+                turn_phase: 'buy_stocks', 
+                tile_ownership: updatedOwnership,
+                active_chains: lobbyInfo.active_chains.filter(c => c !== current_defunct),
+                chain_sizes: { ...lobbyInfo.chain_sizes, [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) + 1 }
+            }).eq('id', lobbyInfo.id);
+        }
     }
     await supabase.from('players').update({ money: m, stocks: s }).eq('id', me.id);
     await supabase.from('lobbies').update({ disposition_turn_index: nextIdx }).eq('id', lobbyInfo.id);
@@ -268,19 +290,25 @@ export default function Home() {
 
   const handleEndGame = async () => {
     if (!lobbyInfo) return;
-    let finalPlayers = [...players];
-    // Liquidate all active chains
+    // AWARD FINAL BONUSES FOR ALL ACTIVE CHAINS
     for (const corp of lobbyInfo.active_chains) {
-      const price = getStockPrice(corp, lobbyInfo.chain_sizes[corp]);
-      // Also award final bonuses before liquidation
       await distributeBonuses(corp, lobbyInfo.chain_sizes[corp]);
-      finalPlayers = finalPlayers.map(p => ({ ...p, money: p.money + (p.stocks[corp] || 0) * price }));
     }
-    for (let p of finalPlayers) await supabase.from('players').update({ money: p.money, stocks: {} }).eq('id', p.id);
+    // FETCH REFRESHED PLAYER DATA FOR FINAL LIQUIDATION
+    const { data: finalP } = await supabase.from('players').select('*').eq('lobby_id', lobbyInfo.id);
+    if (!finalP) return;
+
+    for (let p of finalP) {
+      let finalCash = p.money;
+      CORPORATIONS.forEach(c => {
+        if (p.stocks[c] > 0) finalCash += p.stocks[c] * getStockPrice(c, lobbyInfo.chain_sizes[c]);
+      });
+      await supabase.from('players').update({ money: finalCash, stocks: {} }).eq('id', p.id);
+    }
     await supabase.from('lobbies').update({ status: 'finished' }).eq('id', lobbyInfo.id);
   };
 
-  // --- LOBBY LOGIC ---
+  // --- UI LOGIC ---
   const handleCreateLobby = async (e: any) => {
     e.preventDefault(); if (!playerName) return;
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -313,19 +341,28 @@ export default function Home() {
   };
 
   const netWorth = me ? (me.money + CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, lobbyInfo?.chain_sizes[c] || 0)), 0)) : 0;
-  const canEndGame = (lobbyInfo?.active_chains?.length === 7) && (Object.values(lobbyInfo?.chain_sizes || {}).some((s:any) => s >= 41) || lobbyInfo.active_chains.every((c:any) => lobbyInfo.chain_sizes[c] >= 11));
+  const canEndGame = (lobbyInfo?.active_chains?.length === 7) && (Object.values(lobbyInfo?.chain_sizes || {}).some((s:any) => s >= 41) || lobbyInfo.active_chains.every((c:any) => (lobbyInfo.chain_sizes[c] || 0) >= 11));
+  const isPoolLow = (lobbyInfo?.tile_pool?.length || 0) <= 10 && lobbyInfo?.status === 'playing';
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase">
       {/* HEADER */}
       <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center z-50 sticky top-0">
-        <h1 className="text-xl font-black text-amber-500 italic">Acquire Syndicate</h1>
+        <div className="flex items-center gap-4">
+          <h1 className="text-xl font-black text-amber-500 italic">Acquire Syndicate</h1>
+          {isPoolLow && (
+            <div className="hidden md:flex items-center gap-2 bg-rose-500/10 border border-rose-500/50 px-3 py-1 rounded-full animate-pulse">
+              <span className="w-2 h-2 bg-rose-500 rounded-full shadow-[0_0_8px_rgba(244,63,94,0.8)]"></span>
+              <span className="text-[9px] font-black text-rose-500 tracking-widest uppercase">Resources Depleted: {lobbyInfo?.tile_pool?.length} Tiles Left</span>
+            </div>
+          )}
+        </div>
         <div className="flex gap-2">
             <button onClick={toggleVoice} className={`text-[9px] px-3 py-1 rounded-full border ${isMicActive ? 'bg-emerald-500 text-black animate-pulse' : 'bg-slate-800 text-slate-500 border-slate-700'}`}>
-              {isMicActive ? '🎙 COMMS LIVE' : '🎤 MIC OFF'}
+              {isMicActive ? '🎙 Comms Live' : '🎤 Mic Off'}
             </button>
             {lobbyInfo?.status === 'playing' && canEndGame && me?.play_order === lobbyInfo.current_turn_index && (
-               <button onClick={handleEndGame} className="bg-rose-600 px-4 py-1 rounded-full font-black text-[9px] border border-rose-400">End Game</button>
+               <button onClick={handleEndGame} className="bg-rose-600 px-4 py-1 rounded-full font-black text-[9px] border border-rose-400">End Operation</button>
             )}
             {lobbyInfo && <span className="text-[10px] font-mono bg-amber-500/10 text-amber-500 px-3 py-1.5 rounded-full border border-amber-500/20">{lobbyInfo.join_code}</span>}
         </div>
@@ -343,18 +380,18 @@ export default function Home() {
                     </div>
                  ))}
               </div>
-              <button onClick={() => window.location.reload()} className="mt-10 bg-amber-500 text-black px-8 py-3 rounded-xl font-black">New Operation</button>
+              <button onClick={() => window.location.reload()} className="mt-10 bg-amber-500 text-black px-8 py-3 rounded-xl font-black uppercase">New Operation</button>
            </div>
         ) : !lobbyInfo ? (
            <div className="max-w-md mx-auto pt-20 px-6 space-y-4">
-              <input type="text" value={playerName} onChange={e => setPlayerName(e.target.value)} className="w-full bg-slate-900 p-4 rounded-xl border border-slate-800 outline-none focus:border-amber-500" placeholder="Agent Alias"/>
+              <input type="text" value={playerName} onChange={e => setPlayerName(e.target.value)} className="w-full bg-slate-900 p-4 rounded-xl border border-slate-800 outline-none focus:border-amber-500 uppercase" placeholder="Agent Alias"/>
               <div className="grid grid-cols-2 gap-4">
                 <button onClick={() => setView('create')} className="bg-amber-500 text-black font-black p-4 rounded-xl uppercase">Create</button>
                 <button onClick={() => setView('join')} className="border-2 border-amber-500 text-amber-500 font-black p-4 rounded-xl uppercase">Join</button>
               </div>
               {view === 'join' && <input type="text" value={joinCodeInput} onChange={e => setJoinCodeInput(e.target.value.toUpperCase())} className="w-full bg-slate-900 p-4 rounded-xl border border-slate-800 text-center font-mono uppercase" placeholder="XXXXXX"/>}
               {(view === 'join' || view === 'create') && playerName && (
-                <button onClick={view === 'create' ? handleCreateLobby : handleJoinLobby} className="w-full bg-emerald-500 text-white font-black p-4 rounded-xl uppercase">Confirm Operation</button>
+                <button onClick={view === 'create' ? handleCreateLobby : handleJoinLobby} className="w-full bg-emerald-500 text-white font-black p-4 rounded-xl uppercase tracking-widest">Confirm Operation</button>
               )}
            </div>
         ) : lobbyInfo.status === 'waiting' ? (
@@ -375,7 +412,7 @@ export default function Home() {
                       <h3 className="font-black text-amber-500 mb-6 uppercase tracking-widest">Found Building</h3>
                       <div className="grid grid-cols-2 gap-3">
                         {CORPORATIONS.filter(c => !lobbyInfo.active_chains.includes(c)).map(c => (
-                          <button key={c} onClick={() => handleFoundChain(c)} className={`${CORP_METADATA[c].bg} p-4 rounded-xl font-black text-xs`}>{c}</button>
+                          <button key={c} onClick={() => handleFoundChain(c)} className={`${CORP_METADATA[c].bg} p-4 rounded-xl font-black text-xs uppercase`}>{c}</button>
                         ))}
                       </div>
                     </div>
@@ -384,7 +421,7 @@ export default function Home() {
                 {lobbyInfo.turn_phase === 'merger_resolution' && players[lobbyInfo.disposition_turn_index]?.player_name === playerName && (
                   <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm z-40 flex items-center justify-center p-4">
                     <div className="bg-slate-900 p-8 rounded-3xl border border-emerald-500 shadow-2xl text-center max-w-sm w-full">
-                      <h3 className="font-black text-emerald-400 mb-2 uppercase">Merger Disposition</h3>
+                      <h3 className="font-black text-emerald-400 mb-2 uppercase tracking-widest">Merger Disposition</h3>
                       <p className="text-[10px] text-slate-500 mb-6 uppercase tracking-widest">{lobbyInfo.merger_data.current_defunct} is Defunct</p>
                       <div className="flex flex-col gap-3">
                         <button onClick={() => handleDisposition('sell')} className="bg-white text-black font-black py-4 rounded-xl uppercase">Sell All</button>
@@ -399,7 +436,7 @@ export default function Home() {
                     const id = `${c}${r}`;
                     const owner = lobbyInfo.tile_ownership[id];
                     const isPlaced = lobbyInfo.board_state.includes(id);
-                    const isSafe = owner && lobbyInfo.chain_sizes[owner] >= 11;
+                    const isSafe = owner && (lobbyInfo.chain_sizes[owner] || 0) >= 11;
                     return (
                       <div key={id} className={`aspect-square flex flex-col items-center justify-center rounded-md text-[8px] lg:text-[10px] font-bold border transition-all ${isPlaced ? (owner ? `${CORP_METADATA[owner].bg} border-white shadow-md` : 'bg-amber-500 text-black border-amber-400 shadow-sm') : 'bg-slate-800/30 text-slate-700 border-slate-800/50'}`}>
                         {id} {isSafe && <span className="text-[8px] mt-0.5">🛡️</span>}
@@ -415,14 +452,14 @@ export default function Home() {
               </div>
 
               {/* SIDEBAR */}
-              <div className={`lg:col-span-4 flex flex-col gap-4 overflow-y-auto pb-24 lg:pb-0 ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'}`}>
+              <div className={`lg:col-span-4 flex flex-col gap-4 overflow-y-auto pb-24 lg:pb-0 ${mobileTab !== 'market' ? 'hidden lg:flex' : 'flex'}`}>
                  <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800">
                     <h3 className="text-[9px] font-black text-slate-500 mb-3 uppercase tracking-widest">Draw Ceremony</h3>
                     <div className="space-y-1">
                        {players.map(p => (
                           <div key={p.id} className={`flex justify-between items-center px-3 py-2 rounded-lg border ${p.play_order === lobbyInfo.current_turn_index ? 'border-amber-500 bg-amber-500/5' : 'border-transparent bg-slate-800/50'}`}>
                              <span className="text-xs font-bold uppercase">{p.player_name}</span>
-                             <span className="text-[9px] font-black bg-slate-900 px-2 py-1 rounded text-amber-500 font-mono">{p.starting_tile}</span>
+                             <span className="text-[9px] font-black bg-slate-900 px-2 py-1 rounded text-amber-500 font-mono tracking-tighter uppercase">{p.starting_tile}</span>
                           </div>
                        ))}
                     </div>
@@ -453,7 +490,7 @@ export default function Home() {
                               <span>{c} ({size})</span>
                               <div className="flex items-center gap-3">
                                 <span className="text-emerald-400 font-mono">${price}</span>
-                                <button onClick={() => handleBuyStock(c)} disabled={!active || lobbyInfo.current_turn_index !== me?.play_order || stocksBoughtThisTurn >= 3 || (me?.money || 0) < price} className="bg-amber-500 text-black px-2 py-1 rounded text-[9px] disabled:opacity-0 uppercase">Buy</button>
+                                <button onClick={() => handleBuyStock(c)} disabled={!active || lobbyInfo.current_turn_index !== me?.play_order || stocksBoughtThisTurn >= 3 || (me?.money || 0) < price} className="bg-amber-500 text-black px-2 py-1 rounded text-[9px] disabled:opacity-0 uppercase tracking-widest">Buy</button>
                               </div>
                             </div>
                           );
@@ -474,6 +511,11 @@ export default function Home() {
           <button onClick={() => setMobileTab('board')} className={`flex flex-col items-center gap-1 ${mobileTab === 'board' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">◫</span><span className="text-[8px] font-black tracking-widest">Board</span></button>
           <button onClick={() => setMobileTab('market')} className={`flex flex-col items-center gap-1 ${mobileTab === 'market' ? 'text-amber-500' : 'text-slate-600'}`}><span className="text-xl font-bold">＄</span><span className="text-[8px] font-black tracking-widest">Market</span></button>
         </nav>
+      )}
+      {isPoolLow && (
+        <div className="md:hidden h-6 bg-rose-600 text-[8px] font-black text-white flex items-center justify-center tracking-tighter fixed bottom-20 left-0 right-0 z-40 animate-pulse">
+           Resources Depleted: {lobbyInfo?.tile_pool?.length} Tiles Left
+        </div>
       )}
     </main>
   );
