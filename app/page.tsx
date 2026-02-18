@@ -531,8 +531,19 @@ export default function Home() {
     return 'valid';
   };
 
-  const netWorth = me ? (me.money + CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, lobbyInfo?.chain_sizes[c] || 0)), 0)) : 0;
-  const canEndGame = (lobbyInfo?.active_chains?.length === 7) && (Object.values(lobbyInfo?.chain_sizes || {}).some((s: any) => s >= 41) || lobbyInfo.active_chains.every((c: any) => (lobbyInfo.chain_sizes[c] || 0) >= 11));
+  // --- STAT CALCULATIONS ---
+  const activeChains = lobbyInfo?.active_chains || [];
+  const chainSizes = lobbyInfo?.chain_sizes || {};
+  
+  const netWorth = me ? (me.money + CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, chainSizes[c] || 0)), 0)) : 0;
+  
+  // FIXED END GAME CONDITION: 
+  // Game ends if ANY active corp is 41+ OR if ALL active corps are Safe (11+)
+  const canEndGame = activeChains.length > 0 && (
+    activeChains.some(c => (chainSizes[c] || 0) >= 41) || 
+    activeChains.every(c => (chainSizes[c] || 0) >= 11)
+  );
+  
   const isPoolLow = (lobbyInfo?.tile_pool?.length || 0) <= 10 && lobbyInfo?.status === 'playing';
 
   // --- RENDERING ---
