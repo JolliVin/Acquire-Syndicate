@@ -184,9 +184,11 @@ export default function Home() {
 
     const primaryHolders = ranked.filter(p => (p.stocks[corp] || 0) === counts[0]);
     
-    // If there is a tie for Primary, they split the combined Primary and Secondary bonuses
+    // Primary Tie: Split Combined Bonuses & Round UP to nearest $100
     if (primaryHolders.length > 1) {
-      const split = (primaryBonus + secondaryBonus) / primaryHolders.length;
+      let split = (primaryBonus + secondaryBonus) / primaryHolders.length;
+      split = Math.ceil(split / 100) * 100; // Renegade Rule: No $50s
+      
       for (const p of primaryHolders) {
         await supabase.from('players').update({ money: p.money + split }).eq('id', p.id);
       }
@@ -198,8 +200,10 @@ export default function Home() {
       const secondaryHolders = ranked.filter(p => (p.stocks[corp] || 0) === secondMax);
       
       if (secondaryHolders.length > 0) {
-        // If there is a tie for Secondary, they split the Secondary Bonus
-        const splitSecondary = secondaryBonus / secondaryHolders.length;
+        // Secondary Tie: Split Secondary Bonus & Round UP to nearest $100
+        let splitSecondary = secondaryBonus / secondaryHolders.length;
+        splitSecondary = Math.ceil(splitSecondary / 100) * 100; // Renegade Rule: No $50s
+        
         for (const p of secondaryHolders) {
           await supabase.from('players').update({ money: p.money + splitSecondary }).eq('id', p.id);
         }
