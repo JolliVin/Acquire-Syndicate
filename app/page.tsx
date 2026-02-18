@@ -172,8 +172,8 @@ export default function Home() {
   // --- MERGER ENGINE ---
   const distributeBonuses = async (corp: string, size: number) => {
     const price = getStockPrice(corp, size);
-    const majority = price * 10;
-    const minority = price * 5;
+    const primaryBonus = price * 10;
+    const secondaryBonus = price * 5;
     
     const ranked = [...players]
       .filter(p => !p.is_spectator)
@@ -182,25 +182,30 @@ export default function Home() {
     const counts = ranked.map(p => p.stocks[corp] || 0);
     if (counts[0] === 0) return;
 
-    const firsts = ranked.filter(p => (p.stocks[corp] || 0) === counts[0]);
+    const primaryHolders = ranked.filter(p => (p.stocks[corp] || 0) === counts[0]);
     
-    if (firsts.length > 1) {
-      const split = (majority + minority) / firsts.length;
-      for (const p of firsts) {
+    // If there is a tie for Primary, they split the combined Primary and Secondary bonuses
+    if (primaryHolders.length > 1) {
+      const split = (primaryBonus + secondaryBonus) / primaryHolders.length;
+      for (const p of primaryHolders) {
         await supabase.from('players').update({ money: p.money + split }).eq('id', p.id);
       }
     } else {
-      await supabase.from('players').update({ money: firsts[0].money + majority }).eq('id', firsts[0].id);
-      const secondMax = counts.find(c => c < counts[0] && c > 0);
-      const seconds = ranked.filter(p => (p.stocks[corp] || 0) === secondMax);
+      // One Primary Holder gets the full Primary Bonus
+      await supabase.from('players').update({ money: primaryHolders[0].money + primaryBonus }).eq('id', primaryHolders[0].id);
       
-      if (seconds.length > 0) {
-        const splitMinority = minority / seconds.length;
-        for (const p of seconds) {
-          await supabase.from('players').update({ money: p.money + splitMinority }).eq('id', p.id);
+      const secondMax = counts.find(c => c < counts[0] && c > 0);
+      const secondaryHolders = ranked.filter(p => (p.stocks[corp] || 0) === secondMax);
+      
+      if (secondaryHolders.length > 0) {
+        // If there is a tie for Secondary, they split the Secondary Bonus
+        const splitSecondary = secondaryBonus / secondaryHolders.length;
+        for (const p of secondaryHolders) {
+          await supabase.from('players').update({ money: p.money + splitSecondary }).eq('id', p.id);
         }
       } else { 
-        await supabase.from('players').update({ money: firsts[0].money + minority }).eq('id', firsts[0].id); 
+        // Standard rule: If no one else owns stock, the Primary Holder also absorbs the Secondary Bonus
+        await supabase.from('players').update({ money: primaryHolders[0].money + secondaryBonus }).eq('id', primaryHolders[0].id); 
       }
     }
   };
