@@ -160,6 +160,7 @@ export default function Home() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       setIsMicActive(true);
+      // Voice chat dynamically includes EVERYONE in the database, including Spectators
       players.filter(p => p.id !== me?.id).forEach(player => {
         const call = peerInstance.current?.call(player.id.replace(/-/g, ''), stream);
         call?.on('stream', (rms) => { 
@@ -514,18 +515,28 @@ export default function Home() {
   const handleJoinLobby = async (e: any) => {
     e.preventDefault();
     if (!playerName || !joinCodeInput) return;
+    
     const { data: l } = await supabase.from('lobbies').select('*').eq('join_code', joinCodeInput.toUpperCase()).single();
     if (l) {
-      const { count } = await supabase.from('players').select('*', { count: 'exact', head: true }).eq('lobby_id', l.id);
+      // Fetch existing players to calculate proper spectator requirements
+      const { data: existingPlayers } = await supabase.from('players').select('is_spectator').eq('lobby_id', l.id);
+      
+      const activeCount = existingPlayers?.filter(p => !p.is_spectator).length || 0;
+      const isGameStarted = l.status !== 'waiting';
+      
+      // Enforce Spectator Rules: If >=6 active players OR if the game is already playing
+      const isSpectator = activeCount >= 6 || isGameStarted;
+
       const { error } = await supabase.from('players').insert([{
         lobby_id: l.id,
         player_name: playerName,
         is_host: false,
-        is_spectator: (count || 0) >= 6,
-        money: 6000,
+        is_spectator: isSpectator,
+        money: isSpectator ? 0 : 6000, // Spectators don't need initial funding
         stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
         hand: []
       }]);
+      
       if (!error) setLobbyInfo(l as Lobby);
       else alert("Encryption Error.");
     } else alert("Invalid Frequency.");
@@ -597,12 +608,21 @@ export default function Home() {
   
   const isPoolLow = (lobbyInfo?.tile_pool?.length || 0) <= 10 && lobbyInfo?.status === 'playing';
 
+  // --- PRE-COMPUTE PLAYER CATEGORIES ---
+  const activePlayers = players.filter(p => !p.is_spectator);
+  const spectatorPlayers = players.filter(p => p.is_spectator);
+
   // --- RENDERING ---
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase">
       <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center z-50 sticky top-0 shadow-lg">
         <div className="flex items-center gap-4">
           <h1 className="text-xl font-black text-amber-500 italic tracking-tighter">Syndicate Terminal</h1>
+          {me?.is_spectator && (
+            <span className="hidden md:inline-block text-[10px] font-mono bg-cyan-500/10 text-cyan-400 px-3 py-1.5 rounded-full border border-cyan-500/20 font-black tracking-widest animate-pulse">
+              OBSERVER MODE
+            </span>
+          )}
           {isPoolLow && (
             <div className="hidden md:flex items-center gap-2 bg-rose-500/10 border border-rose-500/50 px-3 py-1 rounded-full animate-pulse">
               <span className="w-2 h-2 bg-rose-500 rounded-full"></span>
@@ -626,7 +646,7 @@ export default function Home() {
           <div className="flex flex-col items-center justify-center p-6 h-full animate-in fade-in zoom-in duration-500">
             <h2 className="text-5xl font-black text-amber-500 mb-8 italic tracking-tighter">Asset Liquidation Standings</h2>
             <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md space-y-4 shadow-2xl">
-              {[...players].sort((a, b) => b.money - a.money).map((p, i) => (
+              {[...activePlayers].sort((a, b) => b.money - a.money).map((p, i) => (
                 <div key={p.id} className={`flex justify-between items-center p-5 rounded-2xl border transition-all ${i === 0 ? 'border-amber-500 bg-amber-500/10 scale-105' : 'border-slate-800 bg-slate-800/50'}`}>
                   <span className="font-black text-lg">#{i + 1} {p.player_name}</span>
                   <span className="font-mono text-emerald-400 font-bold">${p.money.toLocaleString()}</span>
@@ -652,14 +672,43 @@ export default function Home() {
             )}
           </div>
         ) : lobbyInfo.status === 'waiting' ? (
-          <div className="text-center pt-20 animate-in fade-in duration-700">
+          <div className="text-center pt-10 pb-20 px-4 animate-in fade-in duration-700 h-full overflow-y-auto">
             <p className="text-[10px] text-slate-500 font-black tracking-widest mb-4">Frequency Established</p>
-            <h2 className="text-7xl font-mono text-amber-400 mb-10 tracking-tighter border-y border-slate-800 py-6 inline-block px-12">{lobbyInfo.join_code}</h2>
-            <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 w-80 mx-auto space-y-2 mb-10 shadow-xl">
-              <p className="text-[8px] text-slate-600 font-black mb-4 tracking-widest">Active Operatives</p>
-              {players.map(p => <div key={p.id} className="text-sm font-bold flex justify-between uppercase py-1"><span>{p.player_name}</span> {p.is_host && <span className="text-amber-500 text-[10px]">HOST</span>}</div>)}
+            <h2 className="text-5xl lg:text-7xl font-mono text-amber-400 mb-10 tracking-tighter border-y border-slate-800 py-6 inline-block px-8 lg:px-12">{lobbyInfo.join_code}</h2>
+            
+            <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 w-full max-w-sm mx-auto shadow-xl text-left">
+              {/* Active Operatives Logic */}
+              <p className="text-[8px] text-emerald-500 font-black mb-4 tracking-widest uppercase">Active Operatives ({activePlayers.length}/6)</p>
+              <div className="space-y-2">
+                {activePlayers.map(p => (
+                  <div key={p.id} className="text-sm font-bold flex justify-between uppercase bg-slate-800/50 p-3 rounded-xl border border-slate-800">
+                    <span>{p.player_name}</span>
+                    {p.is_host && <span className="text-amber-500 text-[10px] font-black tracking-widest">HOST</span>}
+                  </div>
+                ))}
+              </div>
+
+              {/* Dynamic Spectator Lounge in Waiting Room */}
+              {spectatorPlayers.length > 0 && (
+                <>
+                  <p className="text-[8px] text-cyan-500 font-black mt-8 mb-4 tracking-widest uppercase border-t border-slate-800 pt-6">Spectator Lounge</p>
+                  <div className="space-y-2">
+                    {spectatorPlayers.map(p => (
+                      <div key={p.id} className="text-xs font-bold flex justify-between uppercase bg-slate-950/50 p-2 rounded-lg border border-slate-800/50 text-slate-400">
+                        <span>{p.player_name}</span>
+                        <span className="text-[9px] font-black tracking-widest">OBSERVER</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
-            {isHost && players.length >= 3 && <button onClick={handleStartGame} className="bg-emerald-500 px-12 py-4 rounded-2xl font-black text-white shadow-xl shadow-emerald-500/20 uppercase tracking-widest hover:scale-105 transition-all">Initiate Operations</button>}
+
+            {isHost && activePlayers.length >= 3 && (
+              <button onClick={handleStartGame} className="mt-10 bg-emerald-500 px-12 py-4 rounded-2xl font-black text-white shadow-xl shadow-emerald-500/20 uppercase tracking-widest hover:scale-105 transition-all">
+                Initiate Operations
+              </button>
+            )}
           </div>
         ) : (
           <div className="max-w-7xl mx-auto h-full grid grid-cols-1 lg:grid-cols-12 gap-0 lg:gap-6 lg:p-6 overflow-hidden">
@@ -667,7 +716,7 @@ export default function Home() {
             <div className={`lg:col-span-8 p-4 lg:p-6 bg-slate-900 lg:rounded-3xl border border-slate-800 overflow-auto flex flex-col relative shadow-inner ${mobileTab !== 'board' ? 'hidden lg:flex' : 'flex'}`}>
               
               {/* FOUNDING OVERLAY */}
-              {lobbyInfo.turn_phase === 'found_chain' && me?.play_order === lobbyInfo.current_turn_index && (
+              {lobbyInfo.turn_phase === 'found_chain' && me?.play_order === lobbyInfo.current_turn_index && !me?.is_spectator && (
                 <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md z-40 flex items-center justify-center p-4">
                   <div className="bg-slate-900 p-8 rounded-3xl border border-amber-500 shadow-2xl text-center max-w-sm w-full">
                     <h3 className="font-black text-amber-500 mb-2 uppercase tracking-widest">Establish Infrastructure</h3>
@@ -682,7 +731,7 @@ export default function Home() {
               )}
 
               {/* MERGER OVERLAY */}
-              {lobbyInfo.turn_phase === 'merger_resolution' && players[lobbyInfo.disposition_turn_index]?.player_name === playerName && (me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0) > 0 && (
+              {lobbyInfo.turn_phase === 'merger_resolution' && players[lobbyInfo.disposition_turn_index]?.player_name === playerName && (me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0) > 0 && !me?.is_spectator && (
                 <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md z-40 flex items-center justify-center p-4">
                   <div className="bg-slate-900 p-8 rounded-3xl border border-emerald-500 shadow-2xl text-center max-w-sm w-full">
                     <h3 className="font-black text-emerald-400 mb-1 uppercase tracking-widest">Hostile Acquisition</h3>
@@ -747,39 +796,45 @@ export default function Home() {
                 }))}
               </div>
 
-              {/* HAND TACTICAL SCANNER */}
-              <div className="flex justify-center gap-2 mt-auto pb-4">
-                {me?.hand?.map((t: string) => {
-                  const legality = getTileLegality(t);
-                  const isMyTurn = lobbyInfo.current_turn_index === me?.play_order;
-                  const isPlacePhase = lobbyInfo.turn_phase === 'place_tile';
-                  
-                  return (
-                    <div key={t} className="relative group">
-                      <button 
-                        onClick={() => handlePlaceTile(t)} 
-                        disabled={!isMyTurn || !isPlacePhase || legality !== 'valid'} 
-                        className={`w-12 h-12 lg:w-16 lg:h-16 font-black rounded-xl shadow-2xl transition-all uppercase relative overflow-hidden flex items-center justify-center
-                          ${legality === 'valid' ? 'bg-amber-500 text-black hover:scale-110 active:scale-95 disabled:opacity-20' : ''}
-                          ${legality === 'temporarily_unplayable' ? 'bg-slate-800 text-slate-600 border border-slate-700 cursor-not-allowed' : ''}
-                          ${legality === 'permanently_unplayable' ? 'bg-rose-950/50 text-rose-500 border border-rose-500/30' : ''}
-                        `}
-                      >
-                        <span className="z-10">{t}</span>
-                        {legality === 'permanently_unplayable' && isMyTurn && isPlacePhase && (
-                          <div onClick={(e) => { e.stopPropagation(); handleSwapTile(t); }} className="absolute inset-0 bg-rose-600 text-white flex items-center justify-center text-[7px] font-black opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer">SWAP TILE</div>
+              {/* HAND TACTICAL SCANNER (Hidden for Spectators) */}
+              {me?.is_spectator ? (
+                <div className="flex justify-center items-center h-20 text-cyan-500/50 font-black text-sm uppercase tracking-[0.4em] bg-slate-950/30 rounded-xl border border-cyan-500/10 mt-auto mb-4">
+                  Observer Protocol Active
+                </div>
+              ) : (
+                <div className="flex justify-center gap-2 mt-auto pb-4">
+                  {me?.hand?.map((t: string) => {
+                    const legality = getTileLegality(t);
+                    const isMyTurn = lobbyInfo.current_turn_index === me?.play_order;
+                    const isPlacePhase = lobbyInfo.turn_phase === 'place_tile';
+                    
+                    return (
+                      <div key={t} className="relative group">
+                        <button 
+                          onClick={() => handlePlaceTile(t)} 
+                          disabled={!isMyTurn || !isPlacePhase || legality !== 'valid'} 
+                          className={`w-12 h-12 lg:w-16 lg:h-16 font-black rounded-xl shadow-2xl transition-all uppercase relative overflow-hidden flex items-center justify-center
+                            ${legality === 'valid' ? 'bg-amber-500 text-black hover:scale-110 active:scale-95 disabled:opacity-20' : ''}
+                            ${legality === 'temporarily_unplayable' ? 'bg-slate-800 text-slate-600 border border-slate-700 cursor-not-allowed' : ''}
+                            ${legality === 'permanently_unplayable' ? 'bg-rose-950/50 text-rose-500 border border-rose-500/30' : ''}
+                          `}
+                        >
+                          <span className="z-10">{t}</span>
+                          {legality === 'permanently_unplayable' && isMyTurn && isPlacePhase && (
+                            <div onClick={(e) => { e.stopPropagation(); handleSwapTile(t); }} className="absolute inset-0 bg-rose-600 text-white flex items-center justify-center text-[7px] font-black opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer">SWAP TILE</div>
+                          )}
+                          <div className="absolute inset-0 bg-gradient-to-tr from-white/10 to-transparent opacity-50" />
+                        </button>
+                        {legality !== 'valid' && (
+                          <div className="absolute -top-10 left-1/2 -translate-x-1/2 bg-black/90 text-[7px] px-3 py-1.5 rounded-lg border border-slate-800 opacity-0 group-hover:opacity-100 whitespace-nowrap z-50 pointer-events-none transition-all shadow-xl">
+                            {legality === 'permanently_unplayable' ? 'ILLEGAL MERGER: SAFE CHAINS' : 'FOUNDING CAP REACHED (MAX 7)'}
+                          </div>
                         )}
-                        <div className="absolute inset-0 bg-gradient-to-tr from-white/10 to-transparent opacity-50" />
-                      </button>
-                      {legality !== 'valid' && (
-                        <div className="absolute -top-10 left-1/2 -translate-x-1/2 bg-black/90 text-[7px] px-3 py-1.5 rounded-lg border border-slate-800 opacity-0 group-hover:opacity-100 whitespace-nowrap z-50 pointer-events-none transition-all shadow-xl">
-                          {legality === 'permanently_unplayable' ? 'ILLEGAL MERGER: SAFE CHAINS' : 'FOUNDING CAP REACHED (MAX 7)'}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
             {/* --- INTELLIGENCE PANEL --- */}
@@ -788,7 +843,8 @@ export default function Home() {
               <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-lg">
                 <h3 className="text-[9px] font-black text-slate-500 mb-3 uppercase tracking-widest">Draw Ceremony Results</h3>
                 <div className="space-y-1">
-                  {players.map(p => (
+                  {/* Only map ACTIVE players here */}
+                  {activePlayers.map(p => (
                     <div key={p.id} className={`flex justify-between items-center px-4 py-2.5 rounded-xl border transition-all ${p.play_order === lobbyInfo.current_turn_index ? 'border-amber-500 bg-amber-500/5 shadow-[0_0_10px_rgba(245,158,11,0.1)]' : 'border-transparent bg-slate-800/50'}`}>
                       <span className="text-xs font-bold uppercase tracking-tight">{p.player_name}</span>
                       <span className="text-[9px] font-black bg-slate-950 px-3 py-1.5 rounded-lg text-amber-500 font-mono tracking-tighter shadow-inner border border-slate-800 uppercase">{p.starting_tile}</span>
@@ -797,30 +853,47 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="bg-slate-900 p-6 rounded-3xl border border-amber-500/20 shadow-2xl relative overflow-hidden group">
-                <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
-                   <span className="text-4xl font-black italic">ASSET</span>
-                </div>
-                <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase border-b border-slate-800 pb-2 tracking-widest">Portfolio Matrix</h3>
-                <div className="flex justify-between items-end mb-6">
-                  <div>
-                    <p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest mb-1">Available Liquidity</p>
-                    <p className="text-3xl font-black text-emerald-400 font-mono tracking-tighter">${me?.money.toLocaleString()}</p>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest mb-1">Total Net Worth</p>
-                    <p className="text-sm font-bold font-mono text-slate-100">${netWorth.toLocaleString()}</p>
+              {/* Dynamic Spectator Lounge in the Game UI */}
+              {spectatorPlayers.length > 0 && (
+                <div className="bg-slate-900 p-4 rounded-2xl border border-cyan-500/20 shadow-lg">
+                  <h3 className="text-[9px] font-black text-cyan-500 mb-3 uppercase tracking-widest">Spectator Lounge</h3>
+                  <div className="flex flex-wrap gap-2">
+                    {spectatorPlayers.map(p => (
+                      <span key={p.id} className="text-[9px] bg-slate-950 text-slate-400 px-3 py-1.5 rounded-lg border border-slate-800 font-bold shadow-inner">
+                        {p.player_name}
+                      </span>
+                    ))}
                   </div>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {CORPORATIONS.map(c => (
-                    <div key={c} className={`flex justify-between items-center text-[10px] font-bold p-3 rounded-xl border transition-all ${me?.stocks[c] ? 'bg-slate-800 border-slate-700 opacity-100' : 'bg-slate-900/50 border-transparent opacity-20 grayscale'}`}>
-                      <span className="uppercase tracking-tighter">{c}</span>
-                      <span className="font-mono text-amber-500 bg-black/40 px-2 py-0.5 rounded-md shadow-inner">{me?.stocks[c] || 0}</span>
+              )}
+
+              {/* Player Portfolio (Hidden/Altered for Spectators) */}
+              {!me?.is_spectator && (
+                <div className="bg-slate-900 p-6 rounded-3xl border border-amber-500/20 shadow-2xl relative overflow-hidden group">
+                  <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
+                     <span className="text-4xl font-black italic">ASSET</span>
+                  </div>
+                  <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase border-b border-slate-800 pb-2 tracking-widest">Portfolio Matrix</h3>
+                  <div className="flex justify-between items-end mb-6">
+                    <div>
+                      <p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest mb-1">Available Liquidity</p>
+                      <p className="text-3xl font-black text-emerald-400 font-mono tracking-tighter">${me?.money.toLocaleString()}</p>
                     </div>
-                  ))}
+                    <div className="text-right">
+                      <p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest mb-1">Total Net Worth</p>
+                      <p className="text-sm font-bold font-mono text-slate-100">${netWorth.toLocaleString()}</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {CORPORATIONS.map(c => (
+                      <div key={c} className={`flex justify-between items-center text-[10px] font-bold p-3 rounded-xl border transition-all ${me?.stocks[c] ? 'bg-slate-800 border-slate-700 opacity-100' : 'bg-slate-900/50 border-transparent opacity-20 grayscale'}`}>
+                        <span className="uppercase tracking-tighter">{c}</span>
+                        <span className="font-mono text-amber-500 bg-black/40 px-2 py-0.5 rounded-md shadow-inner">{me?.stocks[c] || 0}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 shadow-2xl flex-grow flex flex-col">
                 <h3 className="text-[10px] font-black text-slate-500 mb-4 uppercase tracking-widest">Market Exchange</h3>
@@ -829,7 +902,7 @@ export default function Home() {
                     const size = lobbyInfo.chain_sizes[c] || 0;
                     const active = lobbyInfo.active_chains.includes(c);
                     const price = getStockPrice(c, size);
-                    const canBuy = active && (lobbyInfo.current_turn_index === me?.play_order) && (stocksBoughtThisTurn < 3) && ((me?.money || 0) >= price) && ((lobbyInfo.available_stocks[c] || 0) > 0);
+                    const canBuy = active && (lobbyInfo.current_turn_index === me?.play_order) && !me?.is_spectator && (stocksBoughtThisTurn < 3) && ((me?.money || 0) >= price) && ((lobbyInfo.available_stocks[c] || 0) > 0);
                     
                     return (
                       <div key={c} className={`w-full flex justify-between items-center p-3 rounded-xl font-black text-[11px] border transition-all ${active ? 'bg-slate-800 border-slate-700 shadow-md' : 'opacity-10 border-transparent grayscale'}`}>
@@ -842,13 +915,15 @@ export default function Home() {
                         </div>
                         <div className="flex items-center gap-4">
                           <span className="text-emerald-400 font-mono text-sm">${price}</span>
-                          <button onClick={() => handleBuyStock(c)} disabled={!canBuy} className={`px-4 py-2 rounded-lg text-[10px] uppercase tracking-widest shadow-md transition-all ${canBuy ? 'bg-amber-500 text-black hover:bg-amber-400 active:scale-90' : 'bg-slate-950 text-slate-700 cursor-not-allowed opacity-0'}`}>Buy</button>
+                          {!me?.is_spectator && (
+                            <button onClick={() => handleBuyStock(c)} disabled={!canBuy} className={`px-4 py-2 rounded-lg text-[10px] uppercase tracking-widest shadow-md transition-all ${canBuy ? 'bg-amber-500 text-black hover:bg-amber-400 active:scale-90' : 'bg-slate-950 text-slate-700 cursor-not-allowed opacity-0'}`}>Buy</button>
+                          )}
                         </div>
                       </div>
                     );
                   })}
                 </div>
-                {lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks' && (
+                {lobbyInfo.current_turn_index === me?.play_order && lobbyInfo.turn_phase === 'buy_stocks' && !me?.is_spectator && (
                   <button onClick={handleEndTurn} className="w-full bg-emerald-600 py-5 rounded-2xl font-black text-[11px] mt-6 uppercase tracking-[0.2em] shadow-lg shadow-emerald-500/10 flex justify-center items-center gap-3 hover:bg-emerald-500 transition-all active:scale-95 group">
                     <span>COMMIT & TRANSMIT MOVE</span>
                     <span className="bg-black/20 px-3 py-1 rounded-lg text-[9px] font-mono group-hover:bg-black/30">({stocksBoughtThisTurn}/3)</span>
