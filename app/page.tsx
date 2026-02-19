@@ -347,12 +347,25 @@ export default function Home() {
       s[survivor!] = (s[survivor!] || 0) + tradePrs;
     }
 
+    // --- MARKET RESUPPLY LOGIC ---
+    let updatedAvailable = { ...lobbyInfo.available_stocks };
+    // Add defunct shares back to the bank
+    updatedAvailable[current_defunct!] = (updatedAvailable[current_defunct!] || 0) + sellAmt + (tradePrs * 2);
+    // Remove traded survivor shares from the bank
+    updatedAvailable[survivor!] = Math.max(0, (updatedAvailable[survivor!] || 0) - tradePrs);
+
     const activePlayers = players.filter(p => !p.is_spectator);
     const nextIdx = (lobbyInfo.disposition_turn_index + 1) % activePlayers.length;
 
     // Reset local UI state for the next merger
     setSellCount(0);
     setTradePairs(0);
+
+    // Build a single database payload
+    let lobbyPayload: any = {
+      disposition_turn_index: nextIdx,
+      available_stocks: updatedAvailable
+    };
 
     if (nextIdx === lobbyInfo.current_turn_index) {
       const updatedOwnership = { ...lobbyInfo.tile_ownership };
@@ -364,7 +377,8 @@ export default function Home() {
       
       if (remainingDefuncts.length > 0) {
         await distributeBonuses(remainingDefuncts[0], lobbyInfo.chain_sizes[remainingDefuncts[0]]);
-        await supabase.from('lobbies').update({
+        lobbyPayload = {
+          ...lobbyPayload,
           merger_data: { ...lobbyInfo.merger_data, current_defunct: remainingDefuncts[0], defunct_corps: remainingDefuncts },
           disposition_turn_index: lobbyInfo.current_turn_index,
           tile_ownership: updatedOwnership,
@@ -373,10 +387,11 @@ export default function Home() {
             ...lobbyInfo.chain_sizes,
             [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0)
           }
-        }).eq('id', lobbyInfo.id);
+        };
       } else {
         updatedOwnership[tile_placed!] = survivor!;
-        await supabase.from('lobbies').update({
+        lobbyPayload = {
+          ...lobbyPayload,
           turn_phase: 'buy_stocks',
           tile_ownership: updatedOwnership,
           active_chains: lobbyInfo.active_chains.filter(c => c !== current_defunct),
@@ -384,11 +399,13 @@ export default function Home() {
             ...lobbyInfo.chain_sizes,
             [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) + 1
           }
-        }).eq('id', lobbyInfo.id);
+        };
       }
     }
+    
+    // Execute database sync
     await supabase.from('players').update({ money: m, stocks: s }).eq('id', me.id);
-    await supabase.from('lobbies').update({ disposition_turn_index: nextIdx }).eq('id', lobbyInfo.id);
+    await supabase.from('lobbies').update(lobbyPayload).eq('id', lobbyInfo.id);
   };
 
   const handleEndTurn = async () => {
@@ -690,7 +707,16 @@ export default function Home() {
                           <div className="flex gap-2 items-center">
                               <button onClick={() => setTradePairs(Math.max(0, tradePairs - 1))} className="bg-slate-700 w-7 h-7 rounded-md font-black hover:bg-slate-600 transition-colors">-</button>
                               <span className="w-6 font-mono font-bold text-center">{tradePairs}</span>
-                              <button onClick={() => setTradePairs(tradePairs + 1)} disabled={sellCount + ((tradePairs + 1) * 2) > (me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0)} className="bg-slate-700 w-7 h-7 rounded-md font-black hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">+</button>
+                              <button 
+                                onClick={() => setTradePairs(tradePairs + 1)} 
+                                disabled={
+                                  sellCount + ((tradePairs + 1) * 2) > (me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0) || 
+                                  (tradePairs + 1) > (lobbyInfo.available_stocks[lobbyInfo.merger_data.survivor!] || 0)
+                                } 
+                                className="bg-slate-700 w-7 h-7 rounded-md font-black hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                              >
+                                +
+                              </button>
                           </div>
                        </div>
 
