@@ -65,6 +65,13 @@ interface Lobby {
     yesVotes?: string[], 
     noVotes?: string[] 
   };
+  // --- NEW: LEADERSHIP DATA ---
+  host_transfer_data?: {
+    targetId: string | null;
+    rejectedIds: string[];
+    status: 'none' | 'pending';
+    isAutoMigration?: boolean;
+  };
 }
 
 // --- CONSTANTS & METADATA ---
@@ -194,8 +201,11 @@ export default function Home() {
   const [isReentering, setIsReentering] = useState(false);
   const [resumeCountdown, setResumeCountdown] = useState<number | null>(null);
 
-  // --- NEW: SPECTATOR EVACUATION STATE ---
+  // --- SPECTATOR EVACUATION STATE ---
   const [isLeaveLoungeModalOpen, setIsLeaveLoungeModalOpen] = useState(false);
+
+  // --- NEW: LEADERSHIP UI STATE ---
+  const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
 
   const peerInstance = useRef<Peer | null>(null);
 
@@ -204,6 +214,11 @@ export default function Home() {
   const me = useMemo(() => {
     return players.find(p => p.player_name === playerName);
   }, [players, playerName]);
+
+  // Sync isHost state locally based on DB record
+  useEffect(() => {
+    if (me) setIsHost(me.is_host);
+  }, [me?.is_host]);
 
   // --- HEARTBEAT PULSE ENGINE ---
   useEffect(() => {
@@ -220,11 +235,12 @@ export default function Home() {
     return () => clearInterval(interval);
   }, [me?.id, lobbyInfo?.id]);
 
-  // --- TACTICAL LOCKDOWN MONITOR ---
+  // --- TACTICAL LOCKDOWN MONITOR & AUTO-MIGRATION ---
   useEffect(() => {
     if (!lobbyInfo || lobbyInfo.status !== 'playing') return;
     
     const activeOperatives = players.filter(p => !p.is_spectator);
+    const hostOp = players.find(p => p.is_host);
     const now = new Date().getTime();
     
     // Scan for operatives who have failed to pulse within the 15s window.
@@ -233,12 +249,19 @@ export default function Home() {
       return (now - lastSeen) > 15000;
     });
 
+    // Specific Host Connectivity Check
+    const isHostMissing = hostOp && (now - new Date(hostOp.last_seen || 0).getTime()) > 15000;
+
     if (dcPlayers.length > 0 && !lobbyInfo.is_paused) {
       // Initiate Lockdown: Freeze all board and market interactions.
-      const expiry = new Date(now + 300000).toISOString();
+      // If HOST is missing, trigger 2-minute timer (120s). Otherwise 5-minutes (300s).
+      const windowSeconds = isHostMissing ? 120 : 300;
+      const expiry = new Date(now + (windowSeconds * 1000)).toISOString();
+      
       supabase.from('lobbies').update({ 
         is_paused: true, 
-        reconnect_timer: expiry 
+        reconnect_timer: expiry,
+        host_transfer_data: isHostMissing ? { ...lobbyInfo.host_transfer_data, isAutoMigration: true } : lobbyInfo.host_transfer_data
       }).eq('id', lobbyInfo.id);
     } else if (dcPlayers.length === 0 && lobbyInfo.is_paused) {
       // Reconnaissance Successful: Roster is whole.
@@ -269,7 +292,7 @@ export default function Home() {
     }, 1000);
   };
 
-  // --- EXTRACTION WINDOW ENGINE ---
+  // --- EXTRACTION WINDOW ENGINE & MIGRATION TRIGGER ---
   useEffect(() => {
     if (lobbyInfo?.reconnect_timer) {
       const timer = setInterval(() => {
@@ -279,14 +302,19 @@ export default function Home() {
         
         setReconnectSeconds(remaining);
         
-        // Critical: If extraction window reaches zero, trigger automatic liquidation.
+        // Critical: If extraction window reaches zero, determine path.
         if (remaining === 0 && lobbyInfo.status !== 'finished' && lobbyInfo.status !== 'waiting') {
-           handleEndGame(); 
+           // If the lockdown was caused by host loss, trigger re-assignment instead of liquidation
+           if (lobbyInfo.host_transfer_data?.isAutoMigration) {
+             handleExecuteAutoMigration();
+           } else {
+             handleEndGame(); 
+           }
         }
       }, 1000);
       return () => clearInterval(timer);
     }
-  }, [lobbyInfo?.reconnect_timer, lobbyInfo?.status]);
+  }, [lobbyInfo?.reconnect_timer, lobbyInfo?.status, lobbyInfo?.host_transfer_data?.isAutoMigration]);
 
   // --- RE-ENTRY RECOGNITION ENGINE ---
   useEffect(() => {
@@ -454,6 +482,78 @@ export default function Home() {
     }
   }, [lobbyInfo?.turn_phase, lobbyInfo?.disposition_turn_index, lobbyInfo?.merger_data.current_defunct, lobbyInfo?.is_paused, me, players]);
 
+  // --- NEW: COMMAND HIERARCHY LOGIC (HOST TRANSFER) ---
+
+  /**
+   * handleInitiateHostTransfer
+   * Starts the handshake process for leadership reassignment.
+   */
+  const handleInitiateHostTransfer = async (targetId: string) => {
+    if (!lobbyInfo || !me?.is_host) return;
+    await supabase.from('lobbies').update({
+      host_transfer_data: {
+        ...lobbyInfo.host_transfer_data,
+        targetId: targetId,
+        status: 'pending'
+      }
+    }).eq('id', lobbyInfo.id);
+    setIsTransferModalOpen(false);
+  };
+
+  /**
+   * handleResponseHostTransfer
+   * Finalizes or rejects the leadership handshake.
+   */
+  const handleResponseHostTransfer = async (accept: boolean) => {
+    if (!lobbyInfo || !me) return;
+    
+    if (accept) {
+      // Step 1: Strip host from old operative
+      const oldHost = players.find(p => p.is_host);
+      if (oldHost) await supabase.from('players').update({ is_host: false }).eq('id', oldHost.id);
+      
+      // Step 2: Elevate current operative
+      await supabase.from('players').update({ is_host: true }).eq('id', me.id);
+      
+      // Step 3: Clear the handshake state
+      await supabase.from('lobbies').update({
+        host_transfer_data: { targetId: null, rejectedIds: [], status: 'none', isAutoMigration: false }
+      }).eq('id', lobbyInfo.id);
+    } else {
+      // Rejection: Record ID and reset status
+      const rejected = Array.from(new Set([...(lobbyInfo.host_transfer_data?.rejectedIds || []), me.id]));
+      await supabase.from('lobbies').update({
+        host_transfer_data: { ...lobbyInfo.host_transfer_data, targetId: null, status: 'none', rejectedIds: rejected }
+      }).eq('id', lobbyInfo.id);
+    }
+  };
+
+  /**
+   * handleExecuteAutoMigration
+   * Automatic succession logic if the primary link is lost for 120s.
+   */
+  const handleExecuteAutoMigration = async () => {
+    if (!lobbyInfo) return;
+    const currentHost = players.find(p => p.is_host);
+    const potentialLeaders = players.filter(p => !p.is_spectator && p.id !== currentHost?.id);
+    
+    if (potentialLeaders.length > 0) {
+      const nextLeader = potentialLeaders[0];
+      if (currentHost) await supabase.from('players').update({ is_host: false }).eq('id', currentHost.id);
+      await supabase.from('players').update({ is_host: true }).eq('id', nextLeader.id);
+      
+      // Resuming mission under new leadership
+      await supabase.from('lobbies').update({ 
+        is_paused: false, 
+        reconnect_timer: null,
+        host_transfer_data: { targetId: null, rejectedIds: [], status: 'none', isAutoMigration: false }
+      }).eq('id', lobbyInfo.id);
+    } else {
+      // Zero active backups: Liquidate session.
+      handleEndGame(); 
+    }
+  };
+
   // --- MERGER ENGINE CALCULATIONS ---
 
   /**
@@ -515,11 +615,16 @@ export default function Home() {
     const colValue = parseInt(tile.match(/\d+/)?.[0] || '0');
     const rowChar = tile.match(/[A-I]/)?.[0] || 'A';
     
+    // colValue BOUNDARY FIX APPLIED
     const adjacentPositions = [
       `${colValue - 1}${rowChar}`, `${colValue + 1}${rowChar}`, 
       `${colValue}${String.fromCharCode(rowChar.charCodeAt(0) - 1)}`, 
       `${colValue}${String.fromCharCode(rowChar.charCodeAt(0) + 1)}`
-    ].filter(pos => lobbyInfo.board_state.includes(pos));
+    ].filter(pos => {
+      const c = parseInt(pos.match(/\d+/)?.[0] || '0');
+      const r = pos.match(/[A-I]/)?.[0] || '';
+      return c >= 1 && c <= 12 && r >= 'A' && r <= 'I' && lobbyInfo.board_state.includes(pos);
+    });
 
     const adjacentSyndicates = Array.from(new Set(adjacentPositions.map(pos => lobbyInfo.tile_ownership[pos]).filter((c): c is string => !!c)));
     
@@ -575,11 +680,16 @@ export default function Home() {
     const colVal = parseInt(referenceTile.match(/\d+/)?.[0] || '0');
     const rowVal = referenceTile.match(/[A-I]/)?.[0] || 'A';
     
+    // surroundingCluster BOUNDARY FIX APPLIED
     const surroundingCluster = [
       `${colVal - 1}${rowVal}`, `${colVal + 1}${rowVal}`, 
       `${colVal}${String.fromCharCode(rowVal.charCodeAt(0) - 1)}`, 
       `${colVal}${String.fromCharCode(rowVal.charCodeAt(0) + 1)}`
-    ].filter(pos => lobbyInfo.board_state.includes(pos) && !lobbyInfo.tile_ownership[pos]);
+    ].filter(pos => {
+      const c = parseInt(pos.match(/\d+/)?.[0] || '0');
+      const r = pos.match(/[A-I]/)?.[0] || '';
+      return c >= 1 && c <= 12 && r >= 'A' && r <= 'I' && lobbyInfo.board_state.includes(pos) && !lobbyInfo.tile_ownership[pos];
+    });
     
     const updatedOwnershipMap = { ...lobbyInfo.tile_ownership };
     [referenceTile, ...surroundingCluster].forEach(t => { updatedOwnershipMap[t] = syndicate; });
@@ -923,7 +1033,8 @@ export default function Home() {
       tile_ownership: {},
       available_stocks: CORPORATIONS.reduce((acc, c) => ({ ...acc, [c]: 25 }), {}),
       tile_pool: [],
-      end_session_data: {}
+      end_session_data: {},
+      host_transfer_data: { targetId: null, rejectedIds: [], status: 'none', isAutoMigration: false }
     }]).select().single();
     
     if (newLobby) {
@@ -951,11 +1062,16 @@ export default function Home() {
     const colVal = parseInt(tile.match(/\d+/)?.[0] || '0');
     const rowChar = tile.match(/[A-I]/)?.[0] || 'A';
     
+    // adjPositions colValue BOUNDARY FIX APPLIED
     const adjPositions = [
       `${colVal - 1}${rowChar}`, `${colVal + 1}${rowChar}`, 
       `${colVal}${String.fromCharCode(rowChar.charCodeAt(0) - 1)}`, 
       `${colVal}${String.fromCharCode(rowChar.charCodeAt(0) + 1)}`
-    ].filter(pos => lobbyInfo.board_state.includes(pos));
+    ].filter(pos => {
+      const c = parseInt(pos.match(/\d+/)?.[0] || '0');
+      const r = pos.match(/[A-I]/)?.[0] || '';
+      return c >= 1 && c <= 12 && r >= 'A' && r <= 'I' && lobbyInfo.board_state.includes(pos);
+    });
 
     const adjSyndicates = Array.from(new Set(adjPositions.map(pos => lobbyInfo.tile_ownership[pos]).filter((c): c is string => !!c)));
     const safeSyndicates = adjSyndicates.filter(c => (lobbyInfo.chain_sizes[c] || 0) >= 11);
@@ -1084,6 +1200,12 @@ export default function Home() {
     directive.tags.some(t => t.toLowerCase().includes(ruleSearchTerm.toLowerCase()))
   );
 
+  // Candidates for manual leadership reassignment
+  const transferCandidates = activeOperativeManifest.filter(p => 
+    p.id !== me?.id && 
+    !(lobbyInfo?.host_transfer_data?.rejectedIds || []).includes(p.id)
+  );
+
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase relative overflow-hidden">
       
@@ -1103,6 +1225,16 @@ export default function Home() {
           )}
         </div>
         <div className="flex gap-2">
+          {/* TRANSFER HOST TRIGGER: Only visible to the current commander */}
+          {isHost && (lobbyInfo?.status === 'playing' || lobbyInfo?.status === 'finished') && (
+            <button 
+              onClick={() => setIsTransferModalOpen(true)} 
+              className="text-[9px] px-3 py-1 rounded-full border bg-amber-500 text-black border-amber-400 font-black tracking-widest uppercase hover:brightness-110 shadow-lg shadow-amber-900/20 transition-all"
+            >
+              TRANSFER HOST
+            </button>
+          )}
+
           {lobbyInfo && (
             <button onClick={() => setIsRulesModalOpen(true)} className="text-[9px] px-3 py-1 rounded-full border bg-slate-800 text-amber-400 border-amber-500/30 hover:bg-slate-700 transition-colors tracking-widest font-black uppercase">
               📜 Protocol Directives
@@ -1122,37 +1254,103 @@ export default function Home() {
       {lobbyInfo?.is_paused && (
         <div className="fixed inset-0 bg-slate-950/95 backdrop-blur-md z-[110] flex items-center justify-center p-6 text-center">
           <div className="max-w-md w-full bg-slate-900 border-2 border-rose-600 p-10 rounded-3xl shadow-[0_0_60px_rgba(225,29,72,0.3)] animate-in zoom-in duration-300">
-             <h2 className="text-3xl font-black text-white italic tracking-tighter mb-4 uppercase">Link Severed</h2>
-             <div className="space-y-1 mb-8">
+              <h2 className="text-3xl font-black text-white italic tracking-tighter mb-4 uppercase">Link Severed</h2>
+              
+              {/* Succession Subtitle */}
+              {lobbyInfo.host_transfer_data?.isAutoMigration && (
+                <p className="text-[10px] text-rose-500 font-black tracking-widest mb-4 animate-pulse uppercase">COMMANDER OFFLINE: RE-ASSIGNING LEADERSHIP</p>
+              )}
+
+              <div className="space-y-1 mb-8">
                 {players.filter(p => !p.is_spectator && (new Date().getTime() - new Date(p.last_seen || 0).getTime() > 15000)).map(p => (
                   <p key={p.id} className="text-rose-500 font-mono text-xs tracking-widest font-black uppercase">{p.player_name} OFFLINE / TRACE LOST</p>
                 ))}
-             </div>
-             
-             {resumeCountdown !== null ? (
-               <div className="space-y-4">
-                  <p className="text-[10px] text-emerald-500 font-black tracking-widest uppercase">Stabilizing Link Frequency...</p>
-                  <p className="text-6xl font-black text-white">{resumeCountdown}</p>
-               </div>
-             ) : (
-               <>
-                 <div className="bg-slate-950 p-6 rounded-2xl border border-rose-600/30 mb-8">
-                    <p className="text-[10px] text-slate-500 font-black tracking-[0.3em] mb-2 uppercase">Extraction window</p>
-                    <p className="text-4xl font-mono font-black text-rose-500 uppercase">
-                      {Math.floor(reconnectSeconds / 60)}:{(reconnectSeconds % 60).toString().padStart(2, '0')}
-                    </p>
-                 </div>
-                 <button 
-                  onClick={handleRestartVote} 
-                  disabled={reconnectSeconds > 0 || me?.wants_restart} 
-                  className={`w-full py-4 rounded-xl font-black uppercase tracking-[0.2em] transition-all shadow-lg ${reconnectSeconds > 0 || me?.wants_restart ? 'bg-slate-800 text-slate-600 cursor-not-allowed' : 'bg-amber-500 text-black hover:bg-amber-400'} uppercase`}
-                 >
-                   {me?.wants_restart ? 'Awaiting Roster Consensus' : 'RESTART MISSION'}
-                 </button>
-                 <p className="mt-4 text-[8px] text-slate-600 font-black tracking-widest uppercase italic">Restart Authorization unlocks if link stability fails</p>
-               </>
-             )}
+              </div>
+              
+              {resumeCountdown !== null ? (
+                <div className="space-y-4">
+                   <p className="text-[10px] text-emerald-500 font-black tracking-widest uppercase">Stabilizing Link Frequency...</p>
+                   <p className="text-6xl font-black text-white">{resumeCountdown}</p>
+                </div>
+              ) : (
+                <>
+                  <div className="bg-slate-950 p-6 rounded-2xl border border-rose-600/30 mb-8">
+                     <p className="text-[10px] text-slate-500 font-black tracking-[0.3em] mb-2 uppercase">Extraction window</p>
+                     <p className="text-4xl font-mono font-black text-rose-500 uppercase">
+                       {Math.floor(reconnectSeconds / 60)}:{(reconnectSeconds % 60).toString().padStart(2, '0')}
+                     </p>
+                  </div>
+                  <button 
+                   onClick={handleRestartVote} 
+                   disabled={reconnectSeconds > 0 || me?.wants_restart} 
+                   className={`w-full py-4 rounded-xl font-black uppercase tracking-[0.2em] transition-all shadow-lg ${reconnectSeconds > 0 || me?.wants_restart ? 'bg-slate-800 text-slate-600 cursor-not-allowed' : 'bg-amber-500 text-black hover:bg-amber-400'} uppercase`}
+                  >
+                    {me?.wants_restart ? 'Awaiting Roster Consensus' : 'RESTART MISSION'}
+                  </button>
+                  <p className="mt-4 text-[8px] text-slate-600 font-black tracking-widest uppercase italic">Restart Authorization unlocks if link stability fails</p>
+                </>
+              )}
           </div>
+        </div>
+      )}
+
+      {/* --- COMMAND HIERARCHY: MANUAL TRANSFER MODAL --- */}
+      {isTransferModalOpen && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-sm z-[150] flex items-center justify-center p-6 animate-in fade-in duration-200">
+          <div className="max-w-md w-full bg-slate-900 border-2 border-amber-500/50 p-8 rounded-3xl shadow-2xl overflow-hidden">
+            <h3 className="text-xl font-black text-white italic mb-6 text-center uppercase tracking-tighter">TRANSFER HOST AUTHORITY</h3>
+            <p className="text-[9px] text-slate-500 text-center mb-6 uppercase tracking-widest">Select an active operative to receive full terminal command.</p>
+            <div className="space-y-2 mb-8 max-h-[40vh] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-slate-700">
+              {transferCandidates.length > 0 ? transferCandidates.map(p => (
+                <button 
+                  key={p.id} 
+                  onClick={() => handleInitiateHostTransfer(p.id)}
+                  className="w-full bg-slate-800 p-4 rounded-xl font-black text-xs hover:bg-amber-500 hover:text-black transition-all text-left flex justify-between items-center group uppercase"
+                >
+                  <span>{p.player_name}</span>
+                  <span className="text-[9px] opacity-50 group-hover:opacity-100 font-bold uppercase">INITIATE HANDSHAKE</span>
+                </button>
+              )) : (
+                <p className="text-center text-slate-500 text-[10px] py-10 uppercase italic">No valid active players in range.</p>
+              )}
+            </div>
+            <button 
+              onClick={() => setIsTransferModalOpen(false)} 
+              className="w-full py-4 bg-slate-950 border border-slate-800 rounded-xl text-slate-400 font-black uppercase text-[10px] tracking-widest hover:text-white transition-colors"
+            >
+              CANCEL PROTOCOL
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* --- COMMAND HIERARCHY: HANDSHAKE CONFIRMATION --- */}
+      {lobbyInfo?.host_transfer_data?.status === 'pending' && lobbyInfo.host_transfer_data.targetId === me?.id && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-xl z-[160] flex items-center justify-center p-6 animate-in zoom-in duration-300">
+           <div className="max-w-sm w-full bg-amber-500 p-1 rounded-3xl shadow-[0_0_100px_rgba(245,158,11,0.3)]">
+              <div className="bg-slate-900 rounded-[1.4rem] p-8 text-center border border-amber-500/30">
+                 <div className="w-16 h-16 bg-amber-500/10 border-2 border-amber-500 rounded-full flex items-center justify-center mx-auto mb-6">
+                    <span className="text-2xl">⚡</span>
+                 </div>
+                 <p className="text-[9px] text-amber-500 font-black tracking-[0.3em] mb-4 uppercase">Direct Command Request</p>
+                 <h2 className="text-2xl font-black text-white italic mb-8 uppercase tracking-tighter leading-tight">THE CURRENT HOST IS TRANSFERRING AUTHORITY TO YOU. ACCEPT?</h2>
+                 <div className="flex gap-4">
+                    <button 
+                      onClick={() => handleResponseHostTransfer(true)} 
+                      className="flex-1 bg-emerald-600 py-4 rounded-xl font-black text-white shadow-lg active:scale-95 transition-all uppercase"
+                    >
+                      YES, COMMAND
+                    </button>
+                    <button 
+                      onClick={() => handleResponseHostTransfer(false)} 
+                      className="flex-1 bg-rose-600 py-4 rounded-xl font-black text-white shadow-lg active:scale-95 transition-all uppercase"
+                    >
+                      DECLINE
+                    </button>
+                 </div>
+                 <p className="mt-6 text-[8px] text-slate-500 font-bold uppercase italic tracking-widest">Leadership requires active terminal monitoring</p>
+              </div>
+           </div>
         </div>
       )}
 
@@ -1236,7 +1434,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* LOBBY TERMINATED VIEW */}
         {lobbyInfo?.status === 'terminated' ? (
           <div className="flex items-center justify-center p-6 h-full bg-rose-950/20">
             <div className="bg-slate-900 border-2 border-rose-600 p-10 rounded-3xl text-center shadow-2xl max-lg w-full">
@@ -1298,7 +1495,7 @@ export default function Home() {
             <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md space-y-4 shadow-2xl relative mb-10">
               {[...activeOperativeManifest].sort((a, b) => b.money - a.money).map((p, i) => (
                 <div key={p.id} className={`flex justify-between items-center p-5 rounded-2xl border transition-all ${i === 0 ? 'border-amber-500 bg-amber-500/10 scale-105' : 'border-slate-800 bg-slate-800/50'} uppercase`}>
-                  <span className="font-black text-lg">#{i + 1} {p.player_name}</span>
+                  <span className="font-black text-lg">#{i + 1} {p.player_name} {p.is_host && <b className="text-amber-500 ml-1 text-xs">(HOST)</b>}</span>
                   <div className="flex items-center gap-4">
                     <span className="font-mono text-emerald-400 font-bold uppercase">${p.money.toLocaleString()}</span>
                     
@@ -1353,8 +1550,8 @@ export default function Home() {
               <p className="text-[8px] text-emerald-500 font-black mb-4 tracking-widest uppercase">Active Operatives ({activeOperativeManifest.length}/6)</p>
               <div className="space-y-2">
                 {activeOperativeManifest.map(p => (
-                  <div key={p.id} className="text-sm font-bold flex justify-between uppercase bg-slate-800/50 p-3 rounded-xl border border-slate-800 uppercase">
-                    <span>{p.player_name}</span>
+                  <div key={p.id} className={`text-sm font-bold flex justify-between uppercase p-3 rounded-xl border transition-all ${p.is_host ? 'bg-amber-500/10 border-amber-500 shadow-lg' : 'bg-slate-800/50 border-slate-800'} uppercase`}>
+                    <span>{p.player_name} {p.is_host && <b className="text-amber-500 ml-1 text-xs">(HOST)</b>}</span>
                     {p.is_host && <span className="text-amber-500 text-[10px] font-black tracking-widest uppercase">Host</span>}
                   </div>
                 ))}
@@ -1532,7 +1729,7 @@ export default function Home() {
                 <div className="space-y-1 uppercase">
                   {activeOperativeManifest.map(p => (
                     <div key={p.id} className={`flex justify-between items-center px-4 py-2.5 rounded-xl border transition-all ${p.play_order === lobbyInfo.current_turn_index ? 'border-amber-500 bg-amber-500/5 shadow-[0_0_10px_rgba(245,158,11,0.1)]' : 'border-transparent bg-slate-800/50'} uppercase`}>
-                      <span className="text-xs font-bold uppercase tracking-tight uppercase">{p.player_name}</span>
+                      <span className="text-xs font-bold uppercase tracking-tight uppercase">{p.player_name} {p.is_host && <b className="text-amber-500 ml-1 text-[10px]">(H)</b>}</span>
                       <span className="text-[9px] font-black bg-slate-950 px-3 py-1.5 rounded-lg text-amber-500 font-mono tracking-tighter shadow-inner border border-slate-800 uppercase">{p.starting_tile}</span>
                     </div>
                   ))}
