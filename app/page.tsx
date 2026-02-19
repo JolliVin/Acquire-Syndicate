@@ -56,6 +56,18 @@ const CORPORATIONS = Object.keys(CORP_METADATA);
 const BOARD_ROWS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
 const BOARD_COLS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
+// --- RENEGADE OFFICIAL RULEBOOK DATABASE ---
+const RULEBOOK = [
+  { id: 'turn', title: 'Sequence of Play', tags: ['turn', 'order', 'steps'], text: 'A player’s turn consists of three steps in this exact order: 1. Place one tile onto the grid. 2. Buy up to three stocks of any active corporations. 3. Draw one tile to replace the played tile.' },
+  { id: 'founding', title: 'Founding a Corporation', tags: ['found', 'start', 'create', 'new', 'bonus'], text: 'When a tile is placed next to an unassociated tile, a corporation is founded. The player chooses any available corporation and receives 1 free stock of that corporation as a founder\'s bonus. If all 7 corporations are active, you cannot place a tile that would found an 8th.' },
+  { id: 'growing', title: 'Growing a Corporation', tags: ['grow', 'expand', 'size'], text: 'When a tile is placed adjacent to an existing corporation, it becomes part of that corporation, increasing its size and stock value.' },
+  { id: 'merging', title: 'Merging Corporations', tags: ['merge', 'hostile', 'takeover', 'tie'], text: 'When a tile is placed adjacent to two or more different corporations, a merger occurs. The corporation with the most tiles survives; the smaller ones become defunct. If there is a tie for size, the player who placed the merging tile chooses the survivor.' },
+  { id: 'bonuses', title: 'Merger Bonuses', tags: ['bonus', 'payout', 'majority', 'minority', 'tie'], text: 'When a corporation goes defunct, the Primary (Largest) and Secondary (Second Largest) stockholders are paid bonuses based on the defunct corporation\'s size before the merger. If there is a tie for Primary, the Primary and Secondary bonuses are combined, divided equally among tied players, and rounded UP to the nearest $100. If there is a tie for Secondary, the Secondary bonus is divided equally and rounded UP to the nearest $100. If only one player owns stock, they receive BOTH bonuses.' },
+  { id: 'disposition', title: 'Disposition of Defunct Stock', tags: ['sell', 'trade', 'keep', 'disposition'], text: 'Starting with the merger-maker and proceeding clockwise, players must declare what to do with their defunct stock: 1. SELL to the bank at the defunct corporation\'s pre-merger price. 2. TRADE 2 defunct stocks for 1 survivor stock (if the bank has enough). 3. KEEP the defunct stock in hopes the corporation is re-founded later.' },
+  { id: 'safe', title: 'Safe Corporations', tags: ['safe', '11', 'protect', 'unplayable', 'dead'], text: 'A corporation with 11 or more tiles is "Safe" and can never be swallowed in a merger. A tile that would merge two Safe corporations is permanently unplayable (a "Dead Tile"). You may swap a Dead Tile for a new one instead of placing a tile on your turn.' },
+  { id: 'end', title: 'Ending the Game', tags: ['end', 'win', '41', 'finish'], text: 'The game ends when a player announces it on their turn under one of two conditions: 1. ALL active corporations are Safe (11+ tiles). OR 2. ANY single active corporation has 41 or more tiles. Upon announcement, all majority/minority bonuses are paid out, and all remaining stocks are sold back at current value. The player with the most money wins.' },
+];
+
 // --- UTILITIES ---
 const getTileValue = (tile: string) => {
   const num = parseInt(tile.match(/\d+/)?.[0] || '0');
@@ -97,6 +109,10 @@ export default function Home() {
   const [sellCount, setSellCount] = useState(0);
   const [tradePairs, setTradePairs] = useState(0);
   const autoSkipRef = useRef<string | null>(null);
+  
+  // Rulebook UI State
+  const [isRulesModalOpen, setIsRulesModalOpen] = useState(false);
+  const [ruleSearchTerm, setRuleSearchTerm] = useState('');
 
   const peerInstance = useRef<Peer | null>(null);
 
@@ -160,7 +176,6 @@ export default function Home() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       setIsMicActive(true);
-      // Voice chat dynamically includes EVERYONE in the database, including Spectators
       players.filter(p => p.id !== me?.id).forEach(player => {
         const call = peerInstance.current?.call(player.id.replace(/-/g, ''), stream);
         call?.on('stream', (rms) => { 
@@ -183,7 +198,7 @@ export default function Home() {
         const turnKey = `${lobbyInfo.id}-${defunct}-${lobbyInfo.disposition_turn_index}`;
         if (autoSkipRef.current !== turnKey) {
           autoSkipRef.current = turnKey;
-          handleDisposition(0, 0); // Execute transparent skip
+          handleDisposition(0, 0); 
         }
       }
     }
@@ -204,31 +219,27 @@ export default function Home() {
 
     const primaryHolders = ranked.filter(p => (p.stocks[corp] || 0) === counts[0]);
     
-    // Primary Tie: Split Combined Bonuses & Round UP to nearest $100
     if (primaryHolders.length > 1) {
       let split = (primaryBonus + secondaryBonus) / primaryHolders.length;
-      split = Math.ceil(split / 100) * 100; // Renegade Rule: No $50s
+      split = Math.ceil(split / 100) * 100; 
       
       for (const p of primaryHolders) {
         await supabase.from('players').update({ money: p.money + split }).eq('id', p.id);
       }
     } else {
-      // One Primary Holder gets the full Primary Bonus
       await supabase.from('players').update({ money: primaryHolders[0].money + primaryBonus }).eq('id', primaryHolders[0].id);
       
       const secondMax = counts.find(c => c < counts[0] && c > 0);
       const secondaryHolders = ranked.filter(p => (p.stocks[corp] || 0) === secondMax);
       
       if (secondaryHolders.length > 0) {
-        // Secondary Tie: Split Secondary Bonus & Round UP to nearest $100
         let splitSecondary = secondaryBonus / secondaryHolders.length;
-        splitSecondary = Math.ceil(splitSecondary / 100) * 100; // Renegade Rule: No $50s
+        splitSecondary = Math.ceil(splitSecondary / 100) * 100; 
         
         for (const p of secondaryHolders) {
           await supabase.from('players').update({ money: p.money + splitSecondary }).eq('id', p.id);
         }
       } else { 
-        // Standard rule: If no one else owns stock, the Primary Holder also absorbs the Secondary Bonus
         await supabase.from('players').update({ money: primaryHolders[0].money + secondaryBonus }).eq('id', primaryHolders[0].id); 
       }
     }
@@ -337,32 +348,25 @@ export default function Home() {
     let m = me.money;
     let s = { ...me.stocks };
 
-    // Calculate money gained from selling specific amounts
     if (sellAmt > 0) {
       m += sellAmt * getStockPrice(current_defunct!, lobbyInfo.chain_sizes[current_defunct!]);
     }
     
-    // Deduct total disposed stocks and add new survivor stocks
     s[current_defunct!] -= (sellAmt + (tradePrs * 2));
     if (tradePrs > 0) {
       s[survivor!] = (s[survivor!] || 0) + tradePrs;
     }
 
-    // --- MARKET RESUPPLY LOGIC ---
     let updatedAvailable = { ...lobbyInfo.available_stocks };
-    // Add defunct shares back to the bank
     updatedAvailable[current_defunct!] = (updatedAvailable[current_defunct!] || 0) + sellAmt + (tradePrs * 2);
-    // Remove traded survivor shares from the bank
     updatedAvailable[survivor!] = Math.max(0, (updatedAvailable[survivor!] || 0) - tradePrs);
 
     const activePlayers = players.filter(p => !p.is_spectator);
     const nextIdx = (lobbyInfo.disposition_turn_index + 1) % activePlayers.length;
 
-    // Reset local UI state for the next merger
     setSellCount(0);
     setTradePairs(0);
 
-    // Build a single database payload
     let lobbyPayload: any = {
       disposition_turn_index: nextIdx,
       available_stocks: updatedAvailable
@@ -404,7 +408,6 @@ export default function Home() {
       }
     }
     
-    // Execute database sync
     await supabase.from('players').update({ money: m, stocks: s }).eq('id', me.id);
     await supabase.from('lobbies').update(lobbyPayload).eq('id', lobbyInfo.id);
   };
@@ -453,7 +456,6 @@ export default function Home() {
     await supabase.from('lobbies').update({ status: 'finished' }).eq('id', lobbyInfo.id);
   };
 
-  // --- RENEGADE START (ADJACENCY LOGIC) ---
   const handleStartGame = async () => {
     if (!lobbyInfo) return;
     const active = players.filter(p => !p.is_spectator);
@@ -511,20 +513,16 @@ export default function Home() {
     }).eq('id', lobbyInfo.id);
   };
 
-  // --- LOBBY JOIN/CREATE ---
   const handleJoinLobby = async (e: any) => {
     e.preventDefault();
     if (!playerName || !joinCodeInput) return;
     
     const { data: l } = await supabase.from('lobbies').select('*').eq('join_code', joinCodeInput.toUpperCase()).single();
     if (l) {
-      // Fetch existing players to calculate proper spectator requirements
       const { data: existingPlayers } = await supabase.from('players').select('is_spectator').eq('lobby_id', l.id);
       
       const activeCount = existingPlayers?.filter(p => !p.is_spectator).length || 0;
       const isGameStarted = l.status !== 'waiting';
-      
-      // Enforce Spectator Rules: If >=6 active players OR if the game is already playing
       const isSpectator = activeCount >= 6 || isGameStarted;
 
       const { error } = await supabase.from('players').insert([{
@@ -532,7 +530,7 @@ export default function Home() {
         player_name: playerName,
         is_host: false,
         is_spectator: isSpectator,
-        money: isSpectator ? 0 : 6000, // Spectators don't need initial funding
+        money: isSpectator ? 0 : 6000, 
         stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
         hand: []
       }]);
@@ -573,7 +571,6 @@ export default function Home() {
     }
   };
 
-  // --- TACTICAL SCANNER ---
   const getTileLegality = (tile: string) => {
     if (!lobbyInfo) return 'valid';
     const col = parseInt(tile.match(/\d+/)?.[0] || '0');
@@ -593,29 +590,29 @@ export default function Home() {
     return 'valid';
   };
 
-  // --- STAT CALCULATIONS ---
   const activeChains = lobbyInfo?.active_chains || [];
   const chainSizes = lobbyInfo?.chain_sizes || {};
-  
   const netWorth = me ? (me.money + CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, chainSizes[c] || 0)), 0)) : 0;
   
-  // FIXED END GAME CONDITION: 
-  // Game ends if ANY active corp is 41+ OR if ALL active corps are Safe (11+)
   const canEndGame = activeChains.length > 0 && (
     activeChains.some(c => (chainSizes[c] || 0) >= 41) || 
     activeChains.every(c => (chainSizes[c] || 0) >= 11)
   );
   
   const isPoolLow = (lobbyInfo?.tile_pool?.length || 0) <= 10 && lobbyInfo?.status === 'playing';
-
-  // --- PRE-COMPUTE PLAYER CATEGORIES ---
   const activePlayers = players.filter(p => !p.is_spectator);
   const spectatorPlayers = players.filter(p => p.is_spectator);
 
-  // --- RENDERING ---
+  // --- RULE SEARCH LOGIC ---
+  const filteredRules = RULEBOOK.filter(r => 
+    r.title.toLowerCase().includes(ruleSearchTerm.toLowerCase()) || 
+    r.text.toLowerCase().includes(ruleSearchTerm.toLowerCase()) ||
+    r.tags.some(t => t.toLowerCase().includes(ruleSearchTerm.toLowerCase()))
+  );
+
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase">
-      <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center z-50 sticky top-0 shadow-lg">
+    <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase relative">
+      <header className="p-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center z-40 sticky top-0 shadow-lg">
         <div className="flex items-center gap-4">
           <h1 className="text-xl font-black text-amber-500 italic tracking-tighter">Syndicate Terminal</h1>
           {me?.is_spectator && (
@@ -631,6 +628,11 @@ export default function Home() {
           )}
         </div>
         <div className="flex gap-2">
+          {lobbyInfo && (
+            <button onClick={() => setIsRulesModalOpen(true)} className="text-[9px] px-3 py-1 rounded-full border bg-slate-800 text-amber-400 border-amber-500/30 hover:bg-slate-700 transition-colors tracking-widest font-black">
+              📜 PROTOCOL DIRECTIVES
+            </button>
+          )}
           <button onClick={toggleVoice} className={`text-[9px] px-3 py-1 rounded-full border transition-all ${isMicActive ? 'bg-emerald-500 text-black border-emerald-400 animate-pulse' : 'bg-slate-800 text-slate-500 border-slate-700'}`}>
             {isMicActive ? '🎙 Comms Active' : '🎤 Mic Muted'}
           </button>
@@ -640,6 +642,47 @@ export default function Home() {
           {lobbyInfo && <span className="text-[10px] font-mono bg-amber-500/10 text-amber-500 px-3 py-1.5 rounded-full border border-amber-500/20">{lobbyInfo.join_code}</span>}
         </div>
       </header>
+
+      {/* --- PROTOCOL DIRECTIVES (RULES MODAL) --- */}
+      {isRulesModalOpen && (
+        <div className="fixed inset-0 bg-slate-950/95 backdrop-blur-sm z-50 flex flex-col p-4 md:p-8 overflow-hidden animate-in fade-in duration-300">
+          <div className="max-w-3xl w-full mx-auto flex flex-col h-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden">
+            <div className="p-6 border-b border-slate-800 flex justify-between items-center bg-slate-950">
+              <h2 className="text-2xl font-black text-amber-500 italic tracking-tighter">Official Rulebook Archive</h2>
+              <button onClick={() => setIsRulesModalOpen(false)} className="text-slate-500 hover:text-white text-2xl font-black transition-colors">&times;</button>
+            </div>
+            
+            <div className="p-6 bg-slate-900 border-b border-slate-800">
+              <input 
+                type="text" 
+                value={ruleSearchTerm} 
+                onChange={(e) => setRuleSearchTerm(e.target.value)} 
+                placeholder="SEARCH DIRECTIVES (e.g., 'merger', 'tie', 'safe')..." 
+                className="w-full bg-slate-950 p-4 rounded-xl border border-slate-700 text-amber-500 placeholder-slate-600 focus:border-amber-500 outline-none font-mono tracking-widest text-sm transition-all"
+                autoFocus
+              />
+            </div>
+
+            <div className="p-6 overflow-y-auto flex-grow space-y-4">
+              {filteredRules.length === 0 ? (
+                <p className="text-slate-500 text-center text-sm tracking-widest font-black mt-10">NO MATCHING DIRECTIVES FOUND.</p>
+              ) : (
+                filteredRules.map(rule => (
+                  <div key={rule.id} className="bg-slate-800/50 border border-slate-700 p-5 rounded-2xl hover:border-amber-500/50 transition-colors">
+                    <h3 className="text-lg font-black text-slate-200 mb-2 tracking-tight">{rule.title}</h3>
+                    <p className="text-xs text-slate-400 normal-case leading-relaxed font-mono">{rule.text}</p>
+                    <div className="mt-4 flex gap-2 flex-wrap">
+                      {rule.tags.map(tag => (
+                        <span key={tag} className="text-[8px] bg-slate-950 text-slate-500 px-2 py-1 rounded border border-slate-800 tracking-widest font-black">#{tag}</span>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex-grow overflow-hidden relative">
         {lobbyInfo?.status === 'finished' ? (
@@ -677,7 +720,6 @@ export default function Home() {
             <h2 className="text-5xl lg:text-7xl font-mono text-amber-400 mb-10 tracking-tighter border-y border-slate-800 py-6 inline-block px-8 lg:px-12">{lobbyInfo.join_code}</h2>
             
             <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800 w-full max-w-sm mx-auto shadow-xl text-left">
-              {/* Active Operatives Logic */}
               <p className="text-[8px] text-emerald-500 font-black mb-4 tracking-widest uppercase">Active Operatives ({activePlayers.length}/6)</p>
               <div className="space-y-2">
                 {activePlayers.map(p => (
@@ -688,7 +730,6 @@ export default function Home() {
                 ))}
               </div>
 
-              {/* Dynamic Spectator Lounge in Waiting Room */}
               {spectatorPlayers.length > 0 && (
                 <>
                   <p className="text-[8px] text-cyan-500 font-black mt-8 mb-4 tracking-widest uppercase border-t border-slate-800 pt-6">Spectator Lounge</p>
@@ -796,7 +837,7 @@ export default function Home() {
                 }))}
               </div>
 
-              {/* HAND TACTICAL SCANNER (Hidden for Spectators) */}
+              {/* HAND TACTICAL SCANNER */}
               {me?.is_spectator ? (
                 <div className="flex justify-center items-center h-20 text-cyan-500/50 font-black text-sm uppercase tracking-[0.4em] bg-slate-950/30 rounded-xl border border-cyan-500/10 mt-auto mb-4">
                   Observer Protocol Active
@@ -843,7 +884,6 @@ export default function Home() {
               <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 shadow-lg">
                 <h3 className="text-[9px] font-black text-slate-500 mb-3 uppercase tracking-widest">Draw Ceremony Results</h3>
                 <div className="space-y-1">
-                  {/* Only map ACTIVE players here */}
                   {activePlayers.map(p => (
                     <div key={p.id} className={`flex justify-between items-center px-4 py-2.5 rounded-xl border transition-all ${p.play_order === lobbyInfo.current_turn_index ? 'border-amber-500 bg-amber-500/5 shadow-[0_0_10px_rgba(245,158,11,0.1)]' : 'border-transparent bg-slate-800/50'}`}>
                       <span className="text-xs font-bold uppercase tracking-tight">{p.player_name}</span>
@@ -853,7 +893,6 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* Dynamic Spectator Lounge in the Game UI */}
               {spectatorPlayers.length > 0 && (
                 <div className="bg-slate-900 p-4 rounded-2xl border border-cyan-500/20 shadow-lg">
                   <h3 className="text-[9px] font-black text-cyan-500 mb-3 uppercase tracking-widest">Spectator Lounge</h3>
@@ -867,7 +906,6 @@ export default function Home() {
                 </div>
               )}
 
-              {/* Player Portfolio (Hidden/Altered for Spectators) */}
               {!me?.is_spectator && (
                 <div className="bg-slate-900 p-6 rounded-3xl border border-amber-500/20 shadow-2xl relative overflow-hidden group">
                   <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
