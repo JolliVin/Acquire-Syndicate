@@ -16,6 +16,7 @@ interface Player {
   play_order: number | null;
   stocks: Record<string, number>;
   starting_tile: string | null;
+  wants_to_swap?: boolean; // New Flag for Swap Queue
 }
 
 interface MergerData {
@@ -78,7 +79,6 @@ const playTerminalPing = () => {
     const osc = ctx.createOscillator();
     const gainNode = ctx.createGain();
     
-    // Terminal-style synth settings
     osc.type = 'square';
     osc.frequency.setValueAtTime(800, ctx.currentTime);
     osc.frequency.exponentialRampToValueAtTime(1200, ctx.currentTime + 0.1);
@@ -137,11 +137,9 @@ export default function Home() {
   const [tradePairs, setTradePairs] = useState(0);
   const autoSkipRef = useRef<string | null>(null);
   
-  // Rulebook UI State
+  // Rulebook & Notification UI State
   const [isRulesModalOpen, setIsRulesModalOpen] = useState(false);
   const [ruleSearchTerm, setRuleSearchTerm] = useState('');
-
-  // Turn Notification State
   const [isMyTurnAlert, setIsMyTurnAlert] = useState(false);
   const prevTurnRef = useRef<number | null>(null);
 
@@ -189,11 +187,10 @@ export default function Home() {
       
       if (isNewTurn) {
         if (!me.is_spectator && lobbyInfo.current_turn_index === me.play_order) {
-          // If the game JUST started, give the UI 500ms to mount the board first
           setTimeout(() => {
              playTerminalPing();
              setIsMyTurnAlert(true);
-             setTimeout(() => setIsMyTurnAlert(false), 3000); // Hide after 3 seconds
+             setTimeout(() => setIsMyTurnAlert(false), 3000); 
           }, prevTurnRef.current === null ? 500 : 0);
         }
       }
@@ -503,7 +500,7 @@ export default function Home() {
       CORPORATIONS.forEach(c => {
         if (p.stocks[c] > 0) finalCash += p.stocks[c] * getStockPrice(c, lobbyInfo.chain_sizes[c]);
       });
-      await supabase.from('players').update({ money: finalCash, stocks: {} }).eq('id', p.id);
+      await supabase.from('players').update({ money: finalCash, stocks: {}, wants_to_swap: false }).eq('id', p.id);
     }
     await supabase.from('lobbies').update({ status: 'finished' }).eq('id', lobbyInfo.id);
   };
@@ -554,7 +551,8 @@ export default function Home() {
       await supabase.from('players').update({
         play_order: i,
         starting_tile: drawResults[i].tile,
-        hand: pool.splice(-6)
+        hand: pool.splice(-6),
+        wants_to_swap: false
       }).eq('id', drawResults[i].id);
     }
 
@@ -584,7 +582,8 @@ export default function Home() {
         is_spectator: isSpectator,
         money: isSpectator ? 0 : 6000, 
         stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
-        hand: []
+        hand: [],
+        wants_to_swap: false
       }]);
       
       if (!error) setLobbyInfo(l as Lobby);
@@ -616,7 +615,8 @@ export default function Home() {
         is_host: true,
         money: 6000,
         stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
-        hand: []
+        hand: [],
+        wants_to_swap: false
       }]);
       setLobbyInfo(l as Lobby);
       setIsHost(true);
@@ -642,6 +642,28 @@ export default function Home() {
     return 'valid';
   };
 
+  // --- SWAP ENGINE ---
+  const handleRequestSwap = async () => {
+    if (!me || me.is_spectator) return;
+    await supabase.from('players').update({ wants_to_swap: true }).eq('id', me.id);
+  };
+
+  const handleAcceptSwap = async (activePlayerId: string) => {
+    if (!me || !me.is_spectator) return;
+    
+    // Bench the active player and remove their swap flag
+    await supabase.from('players').update({ 
+      is_spectator: true, 
+      wants_to_swap: false 
+    }).eq('id', activePlayerId);
+    
+    // Promote the observer to the active roster (giving starting cash so they are ready for a new game)
+    await supabase.from('players').update({ 
+      is_spectator: false,
+      money: 6000 
+    }).eq('id', me.id);
+  };
+
   const activeChains = lobbyInfo?.active_chains || [];
   const chainSizes = lobbyInfo?.chain_sizes || {};
   const netWorth = me ? (me.money + CORPORATIONS.reduce((acc, c) => acc + ((me.stocks[c] || 0) * getStockPrice(c, chainSizes[c] || 0)), 0)) : 0;
@@ -654,6 +676,9 @@ export default function Home() {
   const isPoolLow = (lobbyInfo?.tile_pool?.length || 0) <= 10 && lobbyInfo?.status === 'playing';
   const activePlayers = players.filter(p => !p.is_spectator);
   const spectatorPlayers = players.filter(p => p.is_spectator);
+  
+  // Find the first player currently requesting a swap
+  const currentSwapRequest = players.find(p => !p.is_spectator && p.wants_to_swap);
 
   // --- RULE SEARCH LOGIC ---
   const filteredRules = RULEBOOK.filter(r => 
@@ -751,16 +776,43 @@ export default function Home() {
         )}
 
         {lobbyInfo?.status === 'finished' ? (
-          <div className="flex flex-col items-center justify-center p-6 h-full animate-in fade-in zoom-in duration-500">
+          <div className="flex flex-col items-center justify-center p-6 h-full animate-in fade-in zoom-in duration-500 relative">
+            
+            {/* SPECTATOR SWAP DEPLOYMENT POP-UP */}
+            {me?.is_spectator && currentSwapRequest && (
+              <div className="absolute top-10 left-1/2 -translate-x-1/2 z-50 bg-cyan-900 border-2 border-cyan-400 p-6 rounded-3xl shadow-[0_0_40px_rgba(34,211,238,0.3)] w-full max-w-sm text-center animate-in slide-in-from-top duration-500">
+                <p className="text-[10px] text-cyan-200 font-black tracking-[0.3em] mb-2 animate-pulse">ROSTER ADJUSTMENT REQUIRED</p>
+                <h3 className="text-xl font-black text-white italic tracking-tighter mb-6">AGENT {currentSwapRequest.player_name} REQUESTS RELIEF.</h3>
+                <button onClick={() => handleAcceptSwap(currentSwapRequest.id)} className="w-full bg-cyan-500 text-black font-black py-4 rounded-xl uppercase hover:bg-cyan-400 transition-all shadow-lg tracking-widest active:scale-95">
+                  JOIN ACTIVE ROSTER
+                </button>
+              </div>
+            )}
+
             <h2 className="text-5xl font-black text-amber-500 mb-8 italic tracking-tighter">Asset Liquidation Standings</h2>
-            <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md space-y-4 shadow-2xl">
+            
+            <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md space-y-4 shadow-2xl relative">
               {[...activePlayers].sort((a, b) => b.money - a.money).map((p, i) => (
                 <div key={p.id} className={`flex justify-between items-center p-5 rounded-2xl border transition-all ${i === 0 ? 'border-amber-500 bg-amber-500/10 scale-105' : 'border-slate-800 bg-slate-800/50'}`}>
                   <span className="font-black text-lg">#{i + 1} {p.player_name}</span>
-                  <span className="font-mono text-emerald-400 font-bold">${p.money.toLocaleString()}</span>
+                  <div className="flex items-center gap-4">
+                    <span className="font-mono text-emerald-400 font-bold">${p.money.toLocaleString()}</span>
+                    
+                    {/* SWAP BUTTON FOR ACTIVE PLAYERS */}
+                    {!me?.is_spectator && me?.id === p.id && (
+                      <button 
+                        onClick={handleRequestSwap} 
+                        disabled={me.wants_to_swap}
+                        className={`text-[9px] px-3 py-1.5 rounded-lg font-black tracking-widest transition-all ${me.wants_to_swap ? 'bg-amber-500/20 text-amber-500 border border-amber-500/30 cursor-not-allowed' : 'bg-slate-800 text-slate-300 border border-slate-600 hover:bg-slate-700 active:scale-90'}`}
+                      >
+                        {me.wants_to_swap ? 'WAITING FOR RELIEF' : 'SWAP'}
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
+
             <button onClick={() => window.location.reload()} className="mt-10 bg-amber-500 text-black px-8 py-3 rounded-xl font-black uppercase hover:bg-amber-400 transition-colors">Return to Base</button>
           </div>
         ) : !lobbyInfo ? (
