@@ -94,6 +94,10 @@ export default function Home() {
   const [isMicActive, setIsMicActive] = useState(false);
   const [stocksBoughtThisTurn, setStocksBoughtThisTurn] = useState(0);
 
+  const [sellCount, setSellCount] = useState(0);
+  const [tradePairs, setTradePairs] = useState(0);
+  const autoSkipRef = useRef<string | null>(null);
+
   const peerInstance = useRef<Peer | null>(null);
 
   // --- REALTIME ENGINE ---
@@ -168,6 +172,21 @@ export default function Home() {
       alert("Comms Access Denied."); 
     }
   };
+
+  // --- AUTO-SKIP EMPTY DISPOSITIONS ---
+  useEffect(() => {
+    if (!lobbyInfo || !me) return;
+    if (lobbyInfo.turn_phase === 'merger_resolution' && players[lobbyInfo.disposition_turn_index]?.id === me.id) {
+      const defunct = lobbyInfo.merger_data.current_defunct;
+      if (defunct && (me.stocks[defunct] || 0) === 0) {
+        const turnKey = `${lobbyInfo.id}-${defunct}-${lobbyInfo.disposition_turn_index}`;
+        if (autoSkipRef.current !== turnKey) {
+          autoSkipRef.current = turnKey;
+          handleDisposition(0, 0); // Execute transparent skip
+        }
+      }
+    }
+  }, [lobbyInfo?.turn_phase, lobbyInfo?.disposition_turn_index, lobbyInfo?.merger_data.current_defunct]);
 
   // --- MERGER ENGINE ---
   const distributeBonuses = async (corp: string, size: number) => {
@@ -310,24 +329,30 @@ export default function Home() {
     }).eq('id', lobbyInfo.id);
   };
 
-  const handleDisposition = async (action: 'sell' | 'trade' | 'keep') => {
+  const handleDisposition = async (sellAmt: number, tradePrs: number) => {
     if (!lobbyInfo || !me) return;
     const { survivor, current_defunct, defunct_corps, tile_placed } = lobbyInfo.merger_data;
-    const count = me.stocks[current_defunct!] || 0;
+    
     let m = me.money;
     let s = { ...me.stocks };
 
-    if (action === 'sell') {
-      m += count * getStockPrice(current_defunct!, lobbyInfo.chain_sizes[current_defunct!]);
-      s[current_defunct!] = 0;
-    } else if (action === 'trade') {
-      const pairs = Math.floor(count / 2);
-      s[current_defunct!] -= pairs * 2;
-      s[survivor!] = (s[survivor!] || 0) + pairs;
+    // Calculate money gained from selling specific amounts
+    if (sellAmt > 0) {
+      m += sellAmt * getStockPrice(current_defunct!, lobbyInfo.chain_sizes[current_defunct!]);
+    }
+    
+    // Deduct total disposed stocks and add new survivor stocks
+    s[current_defunct!] -= (sellAmt + (tradePrs * 2));
+    if (tradePrs > 0) {
+      s[survivor!] = (s[survivor!] || 0) + tradePrs;
     }
 
     const activePlayers = players.filter(p => !p.is_spectator);
     const nextIdx = (lobbyInfo.disposition_turn_index + 1) % activePlayers.length;
+
+    // Reset local UI state for the next merger
+    setSellCount(0);
+    setTradePairs(0);
 
     if (nextIdx === lobbyInfo.current_turn_index) {
       const updatedOwnership = { ...lobbyInfo.tile_ownership };
@@ -640,16 +665,43 @@ export default function Home() {
               )}
 
               {/* MERGER OVERLAY */}
-              {lobbyInfo.turn_phase === 'merger_resolution' && players[lobbyInfo.disposition_turn_index]?.player_name === playerName && (
+              {lobbyInfo.turn_phase === 'merger_resolution' && players[lobbyInfo.disposition_turn_index]?.player_name === playerName && (me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0) > 0 && (
                 <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md z-40 flex items-center justify-center p-4">
                   <div className="bg-slate-900 p-8 rounded-3xl border border-emerald-500 shadow-2xl text-center max-w-sm w-full">
                     <h3 className="font-black text-emerald-400 mb-1 uppercase tracking-widest">Hostile Acquisition</h3>
-                    <p className="text-[9px] text-slate-400 font-bold mb-6 uppercase tracking-widest">{lobbyInfo.merger_data.current_defunct} is being liquidated</p>
-                    <div className="flex flex-col gap-3">
-                      <button onClick={() => handleDisposition('sell')} className="bg-white text-black font-black py-4 rounded-xl uppercase hover:bg-slate-200 transition-all">Sell Assets</button>
-                      <button onClick={() => handleDisposition('trade')} className="bg-amber-600 text-white font-black py-4 rounded-xl uppercase hover:bg-amber-500 transition-all">Trade 2:1 for {lobbyInfo.merger_data.survivor}</button>
-                      <button onClick={() => handleDisposition('keep')} className="bg-slate-800 text-white font-bold py-3 rounded-xl border border-slate-700 uppercase">Maintain Portfolio</button>
+                    <p className="text-[9px] text-slate-400 font-bold mb-4 uppercase tracking-widest">{lobbyInfo.merger_data.current_defunct} is being liquidated</p>
+                    
+                    <div className="bg-slate-800 p-4 rounded-xl mb-6 border border-slate-700">
+                       <p className="text-xs font-bold text-slate-300 mb-4">Your Shares: <span className="text-amber-500 text-lg">{me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0}</span></p>
+                       
+                       {/* Sell Controls */}
+                       <div className="flex justify-between items-center mb-3">
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-rose-400">Sell ($)</span>
+                          <div className="flex gap-2 items-center">
+                              <button onClick={() => setSellCount(Math.max(0, sellCount - 1))} className="bg-slate-700 w-7 h-7 rounded-md font-black hover:bg-slate-600 transition-colors">-</button>
+                              <span className="w-6 font-mono font-bold text-center">{sellCount}</span>
+                              <button onClick={() => setSellCount(sellCount + 1)} disabled={sellCount + (tradePairs * 2) >= (me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0)} className="bg-slate-700 w-7 h-7 rounded-md font-black hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">+</button>
+                          </div>
+                       </div>
+
+                       {/* Trade Controls */}
+                       <div className="flex justify-between items-center mb-4">
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-cyan-400">Trade (2:1 for {lobbyInfo.merger_data.survivor})</span>
+                          <div className="flex gap-2 items-center">
+                              <button onClick={() => setTradePairs(Math.max(0, tradePairs - 1))} className="bg-slate-700 w-7 h-7 rounded-md font-black hover:bg-slate-600 transition-colors">-</button>
+                              <span className="w-6 font-mono font-bold text-center">{tradePairs}</span>
+                              <button onClick={() => setTradePairs(tradePairs + 1)} disabled={sellCount + ((tradePairs + 1) * 2) > (me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0)} className="bg-slate-700 w-7 h-7 rounded-md font-black hover:bg-slate-600 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">+</button>
+                          </div>
+                       </div>
+
+                       {/* Keep Display */}
+                       <div className="flex justify-between items-center mt-4 border-t border-slate-700 pt-4">
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Keep</span>
+                          <span className="font-mono text-emerald-400 font-black text-lg">{(me?.stocks[lobbyInfo.merger_data.current_defunct!] || 0) - sellCount - (tradePairs * 2)}</span>
+                       </div>
                     </div>
+
+                    <button onClick={() => handleDisposition(sellCount, tradePairs)} className="w-full bg-emerald-600 text-white font-black py-4 rounded-xl uppercase hover:bg-emerald-500 transition-all shadow-lg tracking-widest">Execute Strategy</button>
                   </div>
                 </div>
               )}
@@ -673,7 +725,7 @@ export default function Home() {
               <div className="flex justify-center gap-2 mt-auto pb-4">
                 {me?.hand?.map((t: string) => {
                   const legality = getTileLegality(t);
-                  const isMyTurn = lobbyInfo.current_turn_index === me.play_order;
+                  const isMyTurn = lobbyInfo.current_turn_index === me?.play_order;
                   const isPlacePhase = lobbyInfo.turn_phase === 'place_tile';
                   
                   return (
