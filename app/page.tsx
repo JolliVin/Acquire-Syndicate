@@ -989,35 +989,54 @@ export default function Home() {
     e.preventDefault();
     if (!playerName || !joinCodeInput) return;
     
-    const { data: targetLobby } = await supabase.from('lobbies').select('*').eq('join_code', joinCodeInput.toUpperCase()).single();
+    const { data: targetLobby } = await supabase
+      .from('lobbies')
+      .select('*')
+      .eq('join_code', joinCodeInput.toUpperCase())
+      .single();
+
     if (targetLobby) {
-      const { data: currentRoster } = await supabase.from('players').select('*').eq('lobby_id', targetLobby.id);
+      const { data: currentRoster } = await supabase
+        .from('players')
+        .select('*')
+        .eq('lobby_id', targetLobby.id);
       
-      // Recognition check for returning link.
-      const legacyEntry = currentRoster?.find(p => p.player_name === playerName);
+      // Recognition check for returning link (Case-insensitive)
+      const legacyEntry = currentRoster?.find(p => 
+        p.player_name.trim().toLowerCase() === playerName.trim().toLowerCase()
+      );
+
       if (legacyEntry) {
+        // Operative found in roster. Re-establishing link...
         setLobbyInfo(targetLobby as Lobby);
         return;
       }
 
+      // New operative registration logic
       const activeCt = currentRoster?.filter(p => !p.is_spectator).length || 0;
       const started = targetLobby.status !== 'waiting';
       const shouldSpectate = activeCt >= 6 || started;
 
       const { error } = await supabase.from('players').insert([{
         lobby_id: targetLobby.id,
-        player_name: playerName,
+        player_name: playerName.trim(),
         is_host: false,
         is_spectator: shouldSpectate,
         money: shouldSpectate ? 0 : 6000, 
         stocks: CORPORATIONS.reduce((acc, c) => ({ ...acc, [c]: 0 }), {}),
         hand: [],
-        wants_to_swap: false
+        wants_to_swap: false,
+        last_seen: new Date().toISOString()
       }]);
       
-      if (!error) setLobbyInfo(targetLobby as Lobby);
-      else alert("Encryption Protocol Error: Authorization denied.");
-    } else alert("Invalid Frequency: Lobby not found.");
+      if (!error) {
+        setLobbyInfo(targetLobby as Lobby);
+      } else {
+        alert("Encryption Protocol Error: Authorization denied.");
+      }
+    } else {
+      alert("Invalid Frequency: Lobby not found.");
+    }
   };
 
   /**
@@ -1029,7 +1048,9 @@ export default function Home() {
     if (!playerName) return;
     
     const hexCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const { data: newLobby } = await supabase.from('lobbies').insert([{
+    
+    // Step 1: Initialize the Lobby in the DB
+    const { data: newLobby, error: lobbyError } = await supabase.from('lobbies').insert([{
       join_code: hexCode,
       status: 'waiting',
       turn_phase: 'place_tile',
@@ -1044,18 +1065,28 @@ export default function Home() {
       host_transfer_data: { targetId: null, rejectedIds: [], status: 'none', isAutoMigration: false }
     }]).select().single();
     
-    if (newLobby) {
-      await supabase.from('players').insert([{
+    if (newLobby && !lobbyError) {
+      // Step 2: Insert the Host as the first Operative
+      const { error: playerError } = await supabase.from('players').insert([{
         lobby_id: newLobby.id,
-        player_name: playerName,
+        player_name: playerName.trim(),
         is_host: true,
+        is_spectator: false,
         money: 6000,
         stocks: CORPORATIONS.reduce((acc, c) => ({ ...acc, [c]: 0 }), {}),
         hand: [],
-        wants_to_swap: false
+        wants_to_swap: false,
+        last_seen: new Date().toISOString() // Prime heartbeat pulse
       }]);
-      setLobbyInfo(newLobby as Lobby);
-      setIsHost(true);
+
+      if (!playerError) {
+        setLobbyInfo(newLobby as Lobby);
+        setIsHost(true);
+      } else {
+        console.error("Critical Failure: Commander profile could not be written.", playerError);
+      }
+    } else {
+      console.error("Critical Failure: Sector initialization failed.", lobbyError);
     }
   };
 
