@@ -206,6 +206,9 @@ export default function Home() {
 
   // --- NEW: LEADERSHIP UI STATE ---
   const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
+  
+  // --- NEW: WINNER'S TABLE STATE ---
+  const [isWinnersTableOpen, setIsWinnersTableOpen] = useState(false);
 
   const peerInstance = useRef<Peer | null>(null);
 
@@ -359,7 +362,11 @@ export default function Home() {
         .single();
         
       if (pList) setPlayers(pList as Player[]);
-      if (lState) setLobbyInfo(lState as Lobby);
+      if (lState) {
+        setLobbyInfo(lState as Lobby);
+        // Automatically trigger Winners Table if game just finished
+        if (lState.status === 'finished') setIsWinnersTableOpen(true);
+      }
     };
 
     synchronizeData();
@@ -615,7 +622,6 @@ export default function Home() {
     const colValue = parseInt(tile.match(/\d+/)?.[0] || '0');
     const rowChar = tile.match(/[A-I]/)?.[0] || 'A';
     
-    // colValue BOUNDARY FIX APPLIED
     const adjacentPositions = [
       `${colValue - 1}${rowChar}`, `${colValue + 1}${rowChar}`, 
       `${colValue}${String.fromCharCode(rowChar.charCodeAt(0) - 1)}`, 
@@ -680,7 +686,6 @@ export default function Home() {
     const colVal = parseInt(referenceTile.match(/\d+/)?.[0] || '0');
     const rowVal = referenceTile.match(/[A-I]/)?.[0] || 'A';
     
-    // surroundingCluster BOUNDARY FIX APPLIED
     const surroundingCluster = [
       `${colVal - 1}${rowVal}`, `${colVal + 1}${rowVal}`, 
       `${colVal}${String.fromCharCode(rowVal.charCodeAt(0) - 1)}`, 
@@ -888,6 +893,8 @@ export default function Home() {
       is_paused: false,
       reconnect_timer: null
     }).eq('id', lobbyInfo.id);
+    
+    setIsWinnersTableOpen(true);
   };
 
   /**
@@ -1062,7 +1069,6 @@ export default function Home() {
     const colVal = parseInt(tile.match(/\d+/)?.[0] || '0');
     const rowChar = tile.match(/[A-I]/)?.[0] || 'A';
     
-    // adjPositions colValue BOUNDARY FIX APPLIED
     const adjPositions = [
       `${colVal - 1}${rowChar}`, `${colVal + 1}${rowChar}`, 
       `${colVal}${String.fromCharCode(rowChar.charCodeAt(0) - 1)}`, 
@@ -1205,6 +1211,16 @@ export default function Home() {
     p.id !== me?.id && 
     !(lobbyInfo?.host_transfer_data?.rejectedIds || []).includes(p.id)
   );
+  
+  // Dense Ranking Logic for Winner's Table
+  const winnersRanking = useMemo(() => {
+    const sorted = [...activeOperativeManifest].sort((a, b) => b.money - a.money);
+    const uniqueScores = Array.from(new Set(sorted.map(p => p.money)));
+    return sorted.map(p => ({
+      ...p,
+      rank: uniqueScores.indexOf(p.money) + 1
+    }));
+  }, [players]);
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans uppercase relative overflow-hidden">
@@ -1320,6 +1336,47 @@ export default function Home() {
             >
               CANCEL PROTOCOL
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* --- WINNER'S TABLE MODAL --- */}
+      {isWinnersTableOpen && (
+        <div className="fixed inset-0 bg-slate-950/95 backdrop-blur-xl z-[200] flex items-center justify-center p-6 animate-in fade-in zoom-in duration-500">
+          <div className="max-w-md w-full bg-slate-900 border-2 border-amber-500 p-8 rounded-[3rem] shadow-[0_0_100px_rgba(245,158,11,0.2)] text-center relative overflow-hidden">
+             <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-amber-500 to-transparent" />
+             <h2 className="text-4xl font-black text-white italic tracking-tighter mb-2 uppercase">MISSION ACCOMPLISHED</h2>
+             <p className="text-[10px] text-amber-500 font-black tracking-[0.4em] mb-8 uppercase">Final Executive Standings</p>
+             
+             <div className="space-y-3 mb-10">
+               {winnersRanking.map((p) => {
+                 let medal = "";
+                 let textColor = "text-slate-400";
+                 let bgColor = "bg-slate-800/30";
+                 let borderColor = "border-slate-800";
+                 
+                 if (p.rank === 1) { medal = "🥇"; textColor = "text-white"; bgColor = "bg-amber-500/20"; borderColor = "border-amber-500"; }
+                 else if (p.rank === 2) { medal = "🥈"; textColor = "text-slate-200"; bgColor = "bg-slate-400/10"; borderColor = "border-slate-400"; }
+                 else if (p.rank === 3) { medal = "🥉"; textColor = "text-orange-200"; bgColor = "bg-orange-900/10"; borderColor = "border-orange-900/50"; }
+
+                 return (
+                   <div key={p.id} className={`flex justify-between items-center p-4 rounded-2xl border transition-all ${bgColor} ${borderColor} ${p.rank <= 3 ? 'scale-105 shadow-lg' : 'opacity-60 scale-95'}`}>
+                      <div className="flex items-center gap-3">
+                         <span className="text-2xl">{medal}</span>
+                         <span className={`font-black text-sm tracking-tight ${textColor}`}>{p.player_name}</span>
+                      </div>
+                      <span className="font-mono font-black text-emerald-400">${p.money.toLocaleString()}</span>
+                   </div>
+                 );
+               })}
+             </div>
+
+             <button 
+               onClick={() => setIsWinnersTableOpen(false)}
+               className="w-full bg-amber-500 text-black font-black py-4 rounded-2xl uppercase tracking-widest hover:bg-amber-400 transition-all shadow-lg active:scale-95"
+             >
+               Close Protocol
+             </button>
           </div>
         </div>
       )}
