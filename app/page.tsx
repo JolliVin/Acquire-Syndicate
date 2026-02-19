@@ -68,6 +68,33 @@ const RULEBOOK = [
   { id: 'end', title: 'Ending the Game', tags: ['end', 'win', '41', 'finish'], text: 'The game ends when a player announces it on their turn under one of two conditions: 1. ALL active corporations are Safe (11+ tiles). OR 2. ANY single active corporation has 41 or more tiles. Upon announcement, all majority/minority bonuses are paid out, and all remaining stocks are sold back at current value. The player with the most money wins.' },
 ];
 
+// --- AUDIO CUE ENGINE ---
+const playTerminalPing = () => {
+  if (typeof window === 'undefined') return;
+  try {
+    const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioContext) return;
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gainNode = ctx.createGain();
+    
+    // Terminal-style synth settings
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(800, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1200, ctx.currentTime + 0.1);
+    
+    gainNode.gain.setValueAtTime(0.1, ctx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
+    
+    osc.connect(gainNode);
+    gainNode.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.3);
+  } catch (e) {
+    console.error("Audio block: User interaction required first", e);
+  }
+};
+
 // --- UTILITIES ---
 const getTileValue = (tile: string) => {
   const num = parseInt(tile.match(/\d+/)?.[0] || '0');
@@ -114,6 +141,10 @@ export default function Home() {
   const [isRulesModalOpen, setIsRulesModalOpen] = useState(false);
   const [ruleSearchTerm, setRuleSearchTerm] = useState('');
 
+  // Turn Notification State
+  const [isMyTurnAlert, setIsMyTurnAlert] = useState(false);
+  const prevTurnRef = useRef<number | null>(null);
+
   const peerInstance = useRef<Peer | null>(null);
 
   // --- REALTIME ENGINE ---
@@ -148,6 +179,27 @@ export default function Home() {
   }, [lobbyInfo?.id]);
 
   const me = players.find(p => p.player_name === playerName);
+
+  // --- TURN NOTIFICATION ENGINE ---
+  useEffect(() => {
+    if (!lobbyInfo || !me) return;
+    
+    if (lobbyInfo.status === 'playing') {
+      const isNewTurn = prevTurnRef.current !== lobbyInfo.current_turn_index;
+      
+      if (isNewTurn) {
+        if (!me.is_spectator && lobbyInfo.current_turn_index === me.play_order) {
+          // If the game JUST started, give the UI 500ms to mount the board first
+          setTimeout(() => {
+             playTerminalPing();
+             setIsMyTurnAlert(true);
+             setTimeout(() => setIsMyTurnAlert(false), 3000); // Hide after 3 seconds
+          }, prevTurnRef.current === null ? 500 : 0);
+        }
+      }
+      prevTurnRef.current = lobbyInfo.current_turn_index;
+    }
+  }, [lobbyInfo?.current_turn_index, lobbyInfo?.status, me]);
 
   // --- COMMS SYSTEM ---
   useEffect(() => {
@@ -685,6 +737,19 @@ export default function Home() {
       )}
 
       <div className="flex-grow overflow-hidden relative">
+        
+        {/* --- TURN NOTIFICATION OVERLAY --- */}
+        {isMyTurnAlert && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center pointer-events-none">
+            <div className="bg-amber-500/10 border-2 border-amber-500 text-amber-500 px-8 py-6 md:px-12 md:py-8 rounded-3xl shadow-[0_0_80px_rgba(245,158,11,0.4)] backdrop-blur-md animate-in zoom-in-75 fade-in duration-300">
+              <h2 className="text-4xl md:text-6xl font-black italic tracking-tighter uppercase text-center drop-shadow-[0_0_15px_rgba(245,158,11,0.8)]">
+                Authorization<br/>Granted
+              </h2>
+              <p className="text-center mt-4 font-mono text-[10px] md:text-xs tracking-[0.5em] text-amber-200 font-bold">AWAITING YOUR DIRECTIVE</p>
+            </div>
+          </div>
+        )}
+
         {lobbyInfo?.status === 'finished' ? (
           <div className="flex flex-col items-center justify-center p-6 h-full animate-in fade-in zoom-in duration-500">
             <h2 className="text-5xl font-black text-amber-500 mb-8 italic tracking-tighter">Asset Liquidation Standings</h2>
