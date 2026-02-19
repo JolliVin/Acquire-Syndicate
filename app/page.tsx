@@ -40,6 +40,12 @@ interface Lobby {
   tile_pool: string[];
   merger_data: MergerData;
   disposition_turn_index: number;
+  // Tracking for the Session Termination logic
+  end_session_data?: { 
+    phase?: string, 
+    yesVotes?: string[], 
+    noVotes?: string[] 
+  };
 }
 
 // --- CONSTANTS ---
@@ -143,6 +149,9 @@ export default function Home() {
   const [isMyTurnAlert, setIsMyTurnAlert] = useState(false);
   const prevTurnRef = useRef<number | null>(null);
 
+  // New state for session end countdown
+  const [shutdownCountdown, setShutdownCountdown] = useState(10);
+
   const peerInstance = useRef<Peer | null>(null);
 
   // --- REALTIME ENGINE ---
@@ -197,6 +206,25 @@ export default function Home() {
       prevTurnRef.current = lobbyInfo.current_turn_index;
     }
   }, [lobbyInfo?.current_turn_index, lobbyInfo?.status, me]);
+
+  // --- SHUTDOWN TIMER LOGIC ---
+  useEffect(() => {
+    if (lobbyInfo?.end_session_data?.phase === 'countdown' && me?.is_host) {
+      const timer = setInterval(() => {
+        setShutdownCountdown((prev) => {
+          if (prev <= 1) {
+            clearInterval(timer);
+            handleConfirmEndLobby();
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+      return () => clearInterval(timer);
+    } else {
+      setShutdownCountdown(10);
+    }
+  }, [lobbyInfo?.end_session_data?.phase, me?.is_host]);
 
   // --- COMMS SYSTEM ---
   useEffect(() => {
@@ -502,7 +530,7 @@ export default function Home() {
       });
       await supabase.from('players').update({ money: finalCash, stocks: {}, wants_to_swap: false }).eq('id', p.id);
     }
-    await supabase.from('lobbies').update({ status: 'finished' }).eq('id', lobbyInfo.id);
+    await supabase.from('lobbies').update({ status: 'finished', end_session_data: {} }).eq('id', lobbyInfo.id);
   };
 
   const handleStartGame = async () => {
@@ -559,7 +587,8 @@ export default function Home() {
     await supabase.from('lobbies').update({
       status: 'playing',
       board_state: drawResults.map(r => r.tile),
-      tile_pool: pool
+      tile_pool: pool,
+      end_session_data: {}
     }).eq('id', lobbyInfo.id);
   };
 
@@ -605,7 +634,8 @@ export default function Home() {
       chain_sizes: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 0 }), {}),
       tile_ownership: {},
       available_stocks: CORPORATIONS.reduce((a, c) => ({ ...a, [c]: 25 }), {}),
-      tile_pool: []
+      tile_pool: [],
+      end_session_data: {}
     }]).select().single();
     
     if (l) {
@@ -662,6 +692,52 @@ export default function Home() {
       is_spectator: false,
       money: 6000 
     }).eq('id', me.id);
+  };
+
+  // --- SESSION TERMINATION ENGINE ---
+  const handleInitiateEndLobby = async () => {
+    if (!lobbyInfo || !me?.is_host) return;
+    await supabase.from('lobbies').update({ 
+      end_session_data: { phase: 'voting', yesVotes: [], noVotes: [] } 
+    }).eq('id', lobbyInfo.id);
+  };
+
+  const handleVoteEndLobby = async (vote: 'yes' | 'no') => {
+    if (!lobbyInfo || !me) return;
+    const data = lobbyInfo.end_session_data || {};
+    const yesVotes = data.yesVotes || [];
+    const noVotes = data.noVotes || [];
+    
+    if (vote === 'yes' && !yesVotes.includes(me.id)) yesVotes.push(me.id);
+    if (vote === 'no' && !noVotes.includes(me.id)) noVotes.push(me.id);
+
+    // Host doesn't vote, so we check the rest of the active roster
+    const votersNeeded = activePlayers.filter(p => !p.is_host).length;
+
+    if (noVotes.length > 0) {
+      // Unanimous failed, reset session data
+      await supabase.from('lobbies').update({ end_session_data: {} }).eq('id', lobbyInfo.id);
+    } else if (yesVotes.length >= votersNeeded) {
+      // Unanimous YES achieved
+      await supabase.from('lobbies').update({ 
+        end_session_data: { phase: 'countdown' } 
+      }).eq('id', lobbyInfo.id);
+    } else {
+      // Update voting counts
+      await supabase.from('lobbies').update({ 
+        end_session_data: { phase: 'voting', yesVotes, noVotes } 
+      }).eq('id', lobbyInfo.id);
+    }
+  };
+
+  const handleConfirmEndLobby = async () => {
+    if (!lobbyInfo) return;
+    await supabase.from('lobbies').update({ status: 'terminated' }).eq('id', lobbyInfo.id);
+  };
+
+  const handleRetractEndLobby = async () => {
+    if (!lobbyInfo) return;
+    await supabase.from('lobbies').update({ end_session_data: {} }).eq('id', lobbyInfo.id);
   };
 
   const activeChains = lobbyInfo?.active_chains || [];
@@ -775,11 +851,54 @@ export default function Home() {
           </div>
         )}
 
-        {lobbyInfo?.status === 'finished' ? (
+        {/* --- TERMINATED LOBBY VIEW --- */}
+        {lobbyInfo?.status === 'terminated' ? (
+          <div className="flex items-center justify-center p-6 h-full bg-rose-950/20">
+            <div className="bg-slate-900 border-2 border-rose-600 p-10 rounded-3xl text-center shadow-2xl max-w-lg w-full">
+              <p className="text-[10px] text-rose-500 font-black tracking-widest mb-4">CRITICAL OVERRIDE</p>
+              <h2 className="text-4xl font-black text-white italic mb-8 uppercase tracking-tighter">LOBBY DISBANDED</h2>
+              <button onClick={() => window.location.reload()} className="w-full bg-rose-600 text-white font-black py-4 rounded-xl uppercase hover:bg-rose-500 shadow-lg tracking-widest">Return to Base</button>
+            </div>
+          </div>
+        ) : lobbyInfo?.status === 'finished' ? (
           <div className="flex flex-col items-center justify-center p-6 h-full animate-in fade-in zoom-in duration-500 relative">
             
+            {/* END LOBBY VOTE / COUNTDOWN OVERLAYS */}
+            {lobbyInfo.end_session_data?.phase === 'voting' && (
+               <div className="absolute top-10 left-1/2 -translate-x-1/2 z-[60] bg-rose-900/90 border border-rose-500 p-6 rounded-2xl shadow-2xl w-full max-w-md text-center backdrop-blur-md">
+                  {!me?.is_host && !me?.is_spectator ? (
+                    <>
+                      <h3 className="text-lg font-black text-white mb-4 uppercase tracking-tighter">HOST PROPOSED LOBBY SHUTDOWN. COMPLY?</h3>
+                      <div className="flex gap-4">
+                        <button onClick={() => handleVoteEndLobby('yes')} className="flex-1 bg-emerald-600 py-3 rounded-xl font-black text-white shadow-lg">YES</button>
+                        <button onClick={() => handleVoteEndLobby('no')} className="flex-1 bg-rose-600 py-3 rounded-xl font-black text-white shadow-lg">NO</button>
+                      </div>
+                    </>
+                  ) : (
+                    <h3 className="text-sm font-black text-rose-200 tracking-widest animate-pulse">WAITING FOR OPERATIVE CONSENSUS...</h3>
+                  )}
+               </div>
+            )}
+
+            {lobbyInfo.end_session_data?.phase === 'countdown' && (
+               <div className="absolute top-10 left-1/2 -translate-x-1/2 z-[60] bg-black border-2 border-rose-600 p-8 rounded-3xl shadow-[0_0_50px_rgba(225,29,72,0.5)] w-full max-w-md text-center backdrop-blur-md">
+                  {me?.is_host ? (
+                    <>
+                      <h3 className="text-xl font-black text-rose-500 mb-2 uppercase">FINAL PURGE</h3>
+                      <p className="text-6xl font-mono text-white font-black mb-6">{shutdownCountdown}</p>
+                      <div className="flex gap-4">
+                        <button onClick={handleConfirmEndLobby} className="flex-1 bg-rose-600 py-4 rounded-xl font-black text-white shadow-lg active:scale-95 transition-all">END</button>
+                        <button onClick={handleRetractEndLobby} className="flex-1 bg-slate-700 py-4 rounded-xl font-black text-white shadow-lg hover:bg-slate-600 active:scale-95 transition-all">RETRACT</button>
+                      </div>
+                    </>
+                  ) : (
+                    <h3 className="text-lg font-black text-rose-500 tracking-widest animate-pulse uppercase">HOST IS INITIATING SHUTDOWN...</h3>
+                  )}
+               </div>
+            )}
+
             {/* SPECTATOR SWAP DEPLOYMENT POP-UP */}
-            {me?.is_spectator && currentSwapRequest && (
+            {me?.is_spectator && currentSwapRequest && !lobbyInfo.end_session_data?.phase && (
               <div className="absolute top-10 left-1/2 -translate-x-1/2 z-50 bg-cyan-900 border-2 border-cyan-400 p-6 rounded-3xl shadow-[0_0_40px_rgba(34,211,238,0.3)] w-full max-w-sm text-center animate-in slide-in-from-top duration-500">
                 <p className="text-[10px] text-cyan-200 font-black tracking-[0.3em] mb-2 animate-pulse">ROSTER ADJUSTMENT REQUIRED</p>
                 <h3 className="text-xl font-black text-white italic tracking-tighter mb-6">AGENT {currentSwapRequest.player_name} REQUESTS RELIEF.</h3>
@@ -791,7 +910,7 @@ export default function Home() {
 
             <h2 className="text-5xl font-black text-amber-500 mb-8 italic tracking-tighter">Asset Liquidation Standings</h2>
             
-            <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md space-y-4 shadow-2xl relative">
+            <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800 w-full max-w-md space-y-4 shadow-2xl relative mb-10">
               {[...activePlayers].sort((a, b) => b.money - a.money).map((p, i) => (
                 <div key={p.id} className={`flex justify-between items-center p-5 rounded-2xl border transition-all ${i === 0 ? 'border-amber-500 bg-amber-500/10 scale-105' : 'border-slate-800 bg-slate-800/50'}`}>
                   <span className="font-black text-lg">#{i + 1} {p.player_name}</span>
@@ -799,7 +918,7 @@ export default function Home() {
                     <span className="font-mono text-emerald-400 font-bold">${p.money.toLocaleString()}</span>
                     
                     {/* SWAP BUTTON FOR ACTIVE PLAYERS */}
-                    {!me?.is_spectator && me?.id === p.id && (
+                    {!me?.is_spectator && me?.id === p.id && !lobbyInfo.end_session_data?.phase && (
                       <button 
                         onClick={handleRequestSwap} 
                         disabled={me.wants_to_swap}
@@ -813,7 +932,13 @@ export default function Home() {
               ))}
             </div>
 
-            <button onClick={() => window.location.reload()} className="mt-10 bg-amber-500 text-black px-8 py-3 rounded-xl font-black uppercase hover:bg-amber-400 transition-colors">Return to Base</button>
+            <div className="flex gap-4">
+              <button onClick={() => window.location.reload()} className="bg-amber-500 text-black px-8 py-3 rounded-xl font-black uppercase hover:bg-amber-400 transition-colors">Return to Base</button>
+              {/* END SESSION BUTTON FOR HOST ONLY */}
+              {me?.is_host && !lobbyInfo.end_session_data?.phase && (
+                <button onClick={handleInitiateEndLobby} className="bg-rose-950 text-rose-500 border border-rose-500 px-8 py-3 rounded-xl font-black uppercase hover:bg-rose-900 transition-colors tracking-widest">END SESSION</button>
+              )}
+            </div>
           </div>
         ) : !lobbyInfo ? (
           <div className="max-w-md mx-auto pt-20 px-6 space-y-4">
