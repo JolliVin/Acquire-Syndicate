@@ -43,13 +43,13 @@ interface Lobby {
 
 // --- CONSTANTS ---
 const CORP_METADATA: Record<string, { bg: string, text: string, border: string }> = {
-  Sackson: { bg: 'bg-rose-600', text: 'text-white', border: 'border-rose-400' },
+  Sackson: { bg: 'bg-red-600', text: 'text-white', border: 'border-red-400' },
   Festival: { bg: 'bg-green-600', text: 'text-white', border: 'border-green-400' },
   Tower: { bg: 'bg-yellow-500', text: 'text-black', border: 'border-yellow-300' },
-  American: { bg: 'bg-blue-600', text: 'text-white', border: 'border-blue-400' },
-  Worldwide: { bg: 'bg-amber-900', text: 'text-white', border: 'border-amber-700' },
-  Imperial: { bg: 'bg-purple-600', text: 'text-white', border: 'border-purple-400' },
-  Continental: { bg: 'bg-cyan-600', text: 'text-white', border: 'border-cyan-400' },
+  American: { bg: 'bg-blue-800', text: 'text-white', border: 'border-blue-600' },
+  Worldwide: { bg: 'bg-purple-600', text: 'text-white', border: 'border-purple-400' },
+  Imperial: { bg: 'bg-orange-500', text: 'text-white', border: 'border-orange-400' },
+  Continental: { bg: 'bg-sky-400', text: 'text-black', border: 'border-sky-300' },
 };
 
 const CORPORATIONS = Object.keys(CORP_METADATA);
