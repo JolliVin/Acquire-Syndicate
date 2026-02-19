@@ -194,6 +194,9 @@ export default function Home() {
   const [isReentering, setIsReentering] = useState(false);
   const [resumeCountdown, setResumeCountdown] = useState<number | null>(null);
 
+  // --- NEW: SPECTATOR EVACUATION STATE ---
+  const [isLeaveLoungeModalOpen, setIsLeaveLoungeModalOpen] = useState(false);
+
   const peerInstance = useRef<Peer | null>(null);
 
   // --- OPERATIVE LOCAL IDENTITY (THE "ME" FIX) ---
@@ -1031,6 +1034,34 @@ export default function Home() {
     await supabase.from('lobbies').update({ end_session_data: {} }).eq('id', lobbyInfo.id);
   };
 
+  // --- NEW: SPECTATOR EVACUATION LOGIC (LEAVE LOUNGE) ---
+
+  /**
+   * handleExecuteLoungeExit
+   * Permanently deletes the operative record and resets the local terminal.
+   */
+  const handleExecuteLoungeExit = async () => {
+    if (!me?.id || !lobbyInfo?.id) return;
+    
+    // Purge record from Supabase
+    const { error } = await supabase
+      .from('players')
+      .delete()
+      .eq('id', me.id);
+      
+    if (!error) {
+      // Hard reset local state to home view
+      setLobbyInfo(null);
+      setView('home');
+      setIsLeaveLoungeModalOpen(false);
+      
+      // Optional: Clear Peer instance to free hardware
+      peerInstance.current?.destroy();
+    } else {
+      alert("Extraction Failed: Signal Interference detected.");
+    }
+  };
+
   // --- ASSET CALCULATIONS ---
 
   const activeChains = lobbyInfo?.active_chains || [];
@@ -1125,6 +1156,30 @@ export default function Home() {
         </div>
       )}
 
+      {/* --- LEAVE LOUNGE CONFIRMATION MODAL --- */}
+      {isLeaveLoungeModalOpen && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-sm z-[150] flex items-center justify-center p-6 animate-in fade-in duration-200">
+          <div className="max-w-sm w-full bg-slate-900 border-2 border-amber-500/50 p-8 rounded-3xl shadow-[0_0_50px_rgba(245,158,11,0.2)] text-center">
+            <h3 className="text-2xl font-black text-white italic tracking-tighter mb-2 uppercase">Terminate Session?</h3>
+            <p className="text-[10px] text-slate-500 font-bold tracking-widest mb-8 uppercase">You are about to disconnect from this terminal frequency. You can rejoin using the hex code.</p>
+            <div className="flex gap-4">
+              <button 
+                onClick={handleExecuteLoungeExit} 
+                className="flex-1 bg-rose-600 hover:bg-rose-500 text-white font-black py-4 rounded-xl transition-all shadow-lg shadow-rose-900/20 uppercase"
+              >
+                YES
+              </button>
+              <button 
+                onClick={() => setIsLeaveLoungeModalOpen(false)} 
+                className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-black py-4 rounded-xl transition-all uppercase"
+              >
+                NO
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* RULES MODAL: PROTOCOL ARCHIVE */}
       {isRulesModalOpen && (
         <div className="fixed inset-0 bg-slate-950/95 backdrop-blur-sm z-50 flex flex-col p-4 md:p-8 overflow-hidden animate-in fade-in duration-300">
@@ -1184,7 +1239,7 @@ export default function Home() {
         {/* LOBBY TERMINATED VIEW */}
         {lobbyInfo?.status === 'terminated' ? (
           <div className="flex items-center justify-center p-6 h-full bg-rose-950/20">
-            <div className="bg-slate-900 border-2 border-rose-600 p-10 rounded-3xl text-center shadow-2xl max-w-lg w-full">
+            <div className="bg-slate-900 border-2 border-rose-600 p-10 rounded-3xl text-center shadow-2xl max-lg w-full">
               <p className="text-[10px] text-rose-500 font-black tracking-widest mb-4 uppercase">Critical Override Executed</p>
               <h2 className="text-4xl font-black text-white italic mb-8 uppercase tracking-tighter">Lobby Disbanded</h2>
               <button onClick={() => window.location.reload()} className="w-full bg-rose-600 text-white font-black py-4 rounded-xl uppercase hover:bg-rose-500 shadow-lg tracking-widest uppercase">Return to base</button>
@@ -1310,9 +1365,19 @@ export default function Home() {
                   <p className="text-[8px] text-cyan-500 font-black mt-8 mb-4 tracking-widest uppercase border-t border-slate-800 pt-6 uppercase">Observer Lounge</p>
                   <div className="space-y-2">
                     {spectatorOperativeManifest.map(p => (
-                      <div key={p.id} className="text-xs font-bold flex justify-between uppercase bg-slate-950/50 p-2 rounded-lg border border-slate-800/50 text-slate-400 uppercase">
+                      <div key={p.id} className="text-xs font-bold flex justify-between items-center uppercase bg-slate-950/50 p-2 rounded-lg border border-slate-800/50 text-slate-400 uppercase">
                         <span>{p.player_name}</span>
-                        <span className="text-[9px] font-black tracking-widest uppercase">Observer</span>
+                        <div className="flex items-center gap-2">
+                           <span className="text-[9px] font-black tracking-widest uppercase">Observer</span>
+                           {me?.id === p.id && (
+                             <button 
+                               onClick={() => setIsLeaveLoungeModalOpen(true)}
+                               className="text-[8px] bg-rose-600/20 text-rose-500 border border-rose-500/30 px-2 py-1 rounded font-black hover:bg-rose-600 hover:text-white transition-all uppercase"
+                             >
+                               Leave Lounge
+                             </button>
+                           )}
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1413,8 +1478,14 @@ export default function Home() {
 
               {/* OPERATIVE TACTICAL HAND */}
               {me?.is_spectator ? (
-                <div className="flex justify-center items-center h-20 text-cyan-500/50 font-black text-sm uppercase tracking-[0.4em] bg-slate-950/30 rounded-xl border border-cyan-500/10 mt-auto mb-4 uppercase">
-                  Observer protocol active. Interception restricted.
+                <div className="flex flex-col justify-center items-center h-40 bg-slate-950/30 rounded-xl border border-cyan-500/10 mt-auto mb-4 gap-4 uppercase">
+                  <span className="text-cyan-500/50 font-black text-sm tracking-[0.4em] uppercase">Observer protocol active. Interception restricted.</span>
+                  <button 
+                    onClick={() => setIsLeaveLoungeModalOpen(true)}
+                    className="bg-rose-950/20 text-rose-500 border border-rose-500/30 px-6 py-2 rounded-full text-[10px] font-black tracking-widest hover:bg-rose-600 hover:text-white transition-all uppercase"
+                  >
+                    Disconnect from Lounge
+                  </button>
                 </div>
               ) : (
                 <div className="flex justify-center gap-2 mt-auto pb-4 uppercase">
@@ -1474,9 +1545,17 @@ export default function Home() {
                   <h3 className="text-[9px] font-black text-cyan-500 mb-3 uppercase tracking-widest uppercase">Spectator Lounge</h3>
                   <div className="flex flex-wrap gap-2 uppercase">
                     {spectatorOperativeManifest.map(p => (
-                      <span key={p.id} className="text-[9px] bg-slate-950 text-slate-400 px-3 py-1.5 rounded-lg border border-slate-800 font-bold shadow-inner uppercase">
-                        {p.player_name}
-                      </span>
+                      <div key={p.id} className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800 uppercase">
+                        <span className="text-[9px] text-slate-400 font-bold uppercase">{p.player_name}</span>
+                        {me?.id === p.id && (
+                           <button 
+                             onClick={() => setIsLeaveLoungeModalOpen(true)}
+                             className="text-[8px] text-rose-500 font-black hover:underline transition-all uppercase"
+                           >
+                             EXIT
+                           </button>
+                        )}
+                      </div>
                     ))}
                   </div>
                 </div>
