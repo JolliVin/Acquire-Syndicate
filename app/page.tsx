@@ -170,6 +170,43 @@ const getStockPrice = (corp: string, size: number) => {
   return base + bonus;
 };
 
+/**
+ * Flood Fill Grid Analysis
+ * Recursively identifies all unowned connected tiles and adjacent syndicates.
+ */
+const getClusterAndSyndicates = (tile: string, board: string[], ownership: Record<string, string | null>) => {
+  const visited = new Set<string>();
+  const simulatedBoard = new Set([...board, tile]); 
+  const queue = [tile];
+  const cluster: string[] = [];
+  const adjSyndicates = new Set<string>();
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    cluster.push(current);
+
+    const col = parseInt(current.match(/\d+/)?.[0] || '0');
+    const row = current.match(/[A-I]/)?.[0] || 'A';
+    const neighbors = [
+      `${col - 1}${row}`, `${col + 1}${row}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0) - 1)}`, 
+      `${col}${String.fromCharCode(row.charCodeAt(0) + 1)}`
+    ].filter(pos => simulatedBoard.has(pos));
+
+    neighbors.forEach(n => {
+      if (ownership[n]) {
+        adjSyndicates.add(ownership[n]!);
+      } else if (!visited.has(n)) {
+        queue.push(n);
+      }
+    });
+  }
+
+  return { cluster, syndicates: Array.from(adjSyndicates) };
+};
+
 // --- PRIMARY COMPONENT LOGIC ---
 
 export default function Home() {
@@ -568,47 +605,54 @@ export default function Home() {
    * Logic for Primary and Secondary payouts during corporate liquidation.
    */
   const distributeBonuses = async (corp: string, size: number) => {
-    const assetPrice = getStockPrice(corp, size);
-    const primaryBonus = assetPrice * 10;
-    const secondaryBonus = assetPrice * 5;
-    
-    const activeVoters = players.filter(p => !p.is_spectator);
-    const rankedBoard = [...activeVoters].sort((a, b) => (b.stocks[corp] || 0) - (a.stocks[corp] || 0));
-    
-    const holdings = rankedBoard.map(p => p.stocks[corp] || 0);
-    if (holdings[0] === 0) return;
+  const assetPrice = getStockPrice(corp, size);
+  const primaryBonus = assetPrice * 10;
+  const secondaryBonus = assetPrice * 5;
+  
+  const activeVoters = players.filter(p => !p.is_spectator);
+  // Only rank players who actually own the stock
+  const shareholders = activeVoters
+    .filter(p => (p.stocks[corp] || 0) > 0)
+    .sort((a, b) => (b.stocks[corp] || 0) - (a.stocks[corp] || 0));
 
-    const primaryShareholders = rankedBoard.filter(p => (p.stocks[corp] || 0) === holdings[0]);
+  if (shareholders.length === 0) return;
+
+  const maxStocks = shareholders[0].stocks[corp];
+  const primaryShareholders = shareholders.filter(p => p.stocks[corp] === maxStocks);
+
+  if (primaryShareholders.length > 1) {
+    // Tie for Primary: Combined bonuses split and rounded up
+    const splitVal = Math.ceil((primaryBonus + secondaryBonus) / primaryShareholders.length / 100) * 100;
     
-    if (primaryShareholders.length > 1) {
-      // Tie for Primary: Combined bonuses split evenly.
-      let splitVal = (primaryBonus + secondaryBonus) / primaryShareholders.length;
-      splitVal = Math.ceil(splitVal / 100) * 100; 
-      
-      for (const operative of primaryShareholders) {
-        await supabase.from('players').update({ money: operative.money + splitVal }).eq('id', operative.id);
-      }
+    for (const op of primaryShareholders) {
+      await supabase.from('players').update({ money: op.money + splitVal }).eq('id', op.id);
+    }
+  } else {
+    // Single Primary holder
+    const primaryOp = primaryShareholders[0];
+    const remainingHolders = shareholders.filter(p => p.id !== primaryOp.id);
+
+    if (remainingHolders.length === 0) {
+      // ONLY ONE OWNER: Gets Primary + Secondary
+      await supabase.from('players').update({ 
+        money: primaryOp.money + primaryBonus + secondaryBonus 
+      }).eq('id', primaryOp.id);
     } else {
-      // Single Primary: Payout confirmed.
-      await supabase.from('players').update({ money: primaryShareholders[0].money + primaryBonus }).eq('id', primaryShareholders[0].id);
+      // One Primary, check for Secondary ties
+      const secondMaxStocks = remainingHolders[0].stocks[corp];
+      const secondaryShareholders = remainingHolders.filter(p => p.stocks[corp] === secondMaxStocks);
       
-      const secondMaxHold = holdings.find(count => count < holdings[0] && count > 0);
-      const secondaryShareholders = rankedBoard.filter(p => (p.stocks[corp] || 0) === secondMaxHold);
+      // Pay Primary
+      await supabase.from('players').update({ money: primaryOp.money + primaryBonus }).eq('id', primaryOp.id);
       
-      if (secondaryShareholders.length > 0) {
-        // Tie for Secondary: Secondary bonus split.
-        let secondarySplit = secondaryBonus / secondaryShareholders.length;
-        secondarySplit = Math.ceil(secondarySplit / 100) * 100; 
-        
-        for (const operative of secondaryShareholders) {
-          await supabase.from('players').update({ money: operative.money + secondarySplit }).eq('id', operative.id);
-        }
-      } else { 
-        // No secondary owner: Primary takes both bonuses.
-        await supabase.from('players').update({ money: primaryShareholders[0].money + secondaryBonus }).eq('id', primaryShareholders[0].id); 
+      // Pay Secondary (Split if tied)
+      const splitSecondary = Math.ceil(secondaryBonus / secondaryShareholders.length / 100) * 100;
+      for (const op of secondaryShareholders) {
+        await supabase.from('players').update({ money: op.money + splitSecondary }).eq('id', op.id);
       }
     }
-  };
+  }
+};
 
   // --- MISSION CRITICAL ACTIONS ---
 
@@ -619,47 +663,33 @@ export default function Home() {
   const handlePlaceTile = async (tile: string) => {
     if (!lobbyInfo || !me || lobbyInfo.is_paused) return;
     
-    const colValue = parseInt(tile.match(/\d+/)?.[0] || '0');
-    const rowChar = tile.match(/[A-I]/)?.[0] || 'A';
-    
-    const adjacentPositions = [
-      `${colValue - 1}${rowChar}`, `${colValue + 1}${rowChar}`, 
-      `${colValue}${String.fromCharCode(rowChar.charCodeAt(0) - 1)}`, 
-      `${colValue}${String.fromCharCode(rowChar.charCodeAt(0) + 1)}`
-    ].filter(pos => {
-      const c = parseInt(pos.match(/\d+/)?.[0] || '0');
-      const r = pos.match(/[A-I]/)?.[0] || '';
-      return c >= 1 && c <= 12 && r >= 'A' && r <= 'I' && lobbyInfo.board_state.includes(pos);
-    });
-
-    const adjacentSyndicates = Array.from(new Set(adjacentPositions.map(pos => lobbyInfo.tile_ownership[pos]).filter((c): c is string => !!c)));
+    const { cluster, syndicates } = getClusterAndSyndicates(tile, lobbyInfo.board_state, lobbyInfo.tile_ownership);
     
     let targetPhase = 'buy_stocks';
     let dataForMerger: MergerData = {};
 
-    if (adjacentSyndicates.length > 1) {
+    if (syndicates.length > 1) {
       // Hostile Acquisition sequence triggered.
       targetPhase = 'merger_resolution';
-      const sortedByWeight = [...adjacentSyndicates].sort((a, b) => (lobbyInfo.chain_sizes[b] || 0) - (lobbyInfo.chain_sizes[a] || 0));
+      const sortedByWeight = [...syndicates].sort((a, b) => (lobbyInfo.chain_sizes[b] || 0) - (lobbyInfo.chain_sizes[a] || 0));
       const leadSyndicate = sortedByWeight[0];
       const defunctSyndicates = sortedByWeight.slice(1);
       
       await distributeBonuses(defunctSyndicates[0], lobbyInfo.chain_sizes[defunctSyndicates[0]]);
       dataForMerger = { survivor: leadSyndicate, current_defunct: defunctSyndicates[0], defunct_corps: defunctSyndicates, tile_placed: tile };
     } 
-    else if (adjacentSyndicates.length === 1) {
+    else if (syndicates.length === 1) {
       // Syndicate Growth sequence.
-      const dominatingSyndicate = adjacentSyndicates[0];
-      const unassignedTiles = adjacentPositions.filter(pos => !lobbyInfo.tile_ownership[pos]);
-      const updatedMapping = { ...lobbyInfo.tile_ownership, [tile]: dominatingSyndicate };
-      unassignedTiles.forEach(t => { updatedMapping[t] = dominatingSyndicate; });
+      const dominatingSyndicate = syndicates[0];
+      const updatedMapping = { ...lobbyInfo.tile_ownership };
+      cluster.forEach(t => { updatedMapping[t] = dominatingSyndicate; });
       
       await supabase.from('lobbies').update({ 
-        chain_sizes: { ...lobbyInfo.chain_sizes, [dominatingSyndicate]: (lobbyInfo.chain_sizes[dominatingSyndicate] || 0) + 1 + unassignedTiles.length },
+        chain_sizes: { ...lobbyInfo.chain_sizes, [dominatingSyndicate]: (lobbyInfo.chain_sizes[dominatingSyndicate] || 0) + cluster.length },
         tile_ownership: updatedMapping 
       }).eq('id', lobbyInfo.id);
     }
-    else if (adjacentSyndicates.length === 0 && adjacentPositions.length > 0 && lobbyInfo.active_chains.length < 7) {
+    else if (syndicates.length === 0 && cluster.length > 1 && lobbyInfo.active_chains.length < 7) {
       // Founding sequence.
       targetPhase = 'found_chain';
     }
@@ -683,26 +713,16 @@ export default function Home() {
     
     const adjustedStocks = { ...(me.stocks || {}), [syndicate]: ((me.stocks || {})[syndicate] || 0) + 1 };
     const referenceTile = lobbyInfo.board_state[lobbyInfo.board_state.length - 1];
-    const colVal = parseInt(referenceTile.match(/\d+/)?.[0] || '0');
-    const rowVal = referenceTile.match(/[A-I]/)?.[0] || 'A';
     
-    const surroundingCluster = [
-      `${colVal - 1}${rowVal}`, `${colVal + 1}${rowVal}`, 
-      `${colVal}${String.fromCharCode(rowVal.charCodeAt(0) - 1)}`, 
-      `${colVal}${String.fromCharCode(rowVal.charCodeAt(0) + 1)}`
-    ].filter(pos => {
-      const c = parseInt(pos.match(/\d+/)?.[0] || '0');
-      const r = pos.match(/[A-I]/)?.[0] || '';
-      return c >= 1 && c <= 12 && r >= 'A' && r <= 'I' && lobbyInfo.board_state.includes(pos) && !lobbyInfo.tile_ownership[pos];
-    });
+    const { cluster } = getClusterAndSyndicates(referenceTile, lobbyInfo.board_state, lobbyInfo.tile_ownership);
     
     const updatedOwnershipMap = { ...lobbyInfo.tile_ownership };
-    [referenceTile, ...surroundingCluster].forEach(t => { updatedOwnershipMap[t] = syndicate; });
+    cluster.forEach(t => { updatedOwnershipMap[t] = syndicate; });
 
     await supabase.from('players').update({ stocks: adjustedStocks }).eq('id', me.id);
     await supabase.from('lobbies').update({ 
       active_chains: [...lobbyInfo.active_chains, syndicate], 
-      chain_sizes: { ...lobbyInfo.chain_sizes, [syndicate]: surroundingCluster.length + 1 }, 
+      chain_sizes: { ...lobbyInfo.chain_sizes, [syndicate]: cluster.length }, 
       tile_ownership: updatedOwnershipMap, 
       available_stocks: { ...lobbyInfo.available_stocks, [syndicate]: (lobbyInfo.available_stocks[syndicate] || 25) - 1 }, 
       turn_phase: 'buy_stocks' 
@@ -795,7 +815,9 @@ export default function Home() {
         };
       } else {
         // Merger finalized. Returning to standard sequence.
-        globalOwnership[tile_placed!] = survivor!;
+        const { cluster } = getClusterAndSyndicates(tile_placed!, lobbyInfo.board_state, lobbyInfo.tile_ownership);
+        cluster.forEach(t => { globalOwnership[t] = survivor!; });
+        
         lobbyTransmission = {
           ...lobbyTransmission,
           turn_phase: 'buy_stocks',
@@ -803,7 +825,7 @@ export default function Home() {
           active_chains: lobbyInfo.active_chains.filter(c => c !== current_defunct),
           chain_sizes: {
             ...lobbyInfo.chain_sizes,
-            [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) + 1
+            [survivor!]: (lobbyInfo.chain_sizes[survivor!] || 0) + (lobbyInfo.chain_sizes[current_defunct!] || 0) + cluster.length
           }
         };
       }
@@ -1097,27 +1119,14 @@ export default function Home() {
   const getTileLegality = (tile: string) => {
     if (!lobbyInfo) return 'valid';
     
-    const colVal = parseInt(tile.match(/\d+/)?.[0] || '0');
-    const rowChar = tile.match(/[A-I]/)?.[0] || 'A';
-    
-    const adjPositions = [
-      `${colVal - 1}${rowChar}`, `${colVal + 1}${rowChar}`, 
-      `${colVal}${String.fromCharCode(rowChar.charCodeAt(0) - 1)}`, 
-      `${colVal}${String.fromCharCode(rowChar.charCodeAt(0) + 1)}`
-    ].filter(pos => {
-      const c = parseInt(pos.match(/\d+/)?.[0] || '0');
-      const r = pos.match(/[A-I]/)?.[0] || '';
-      return c >= 1 && c <= 12 && r >= 'A' && r <= 'I' && lobbyInfo.board_state.includes(pos);
-    });
-
-    const adjSyndicates = Array.from(new Set(adjPositions.map(pos => lobbyInfo.tile_ownership[pos]).filter((c): c is string => !!c)));
-    const safeSyndicates = adjSyndicates.filter(c => (lobbyInfo.chain_sizes[c] || 0) >= 11);
+    const { cluster, syndicates } = getClusterAndSyndicates(tile, lobbyInfo.board_state, lobbyInfo.tile_ownership);
+    const safeSyndicates = syndicates.filter(c => (lobbyInfo.chain_sizes[c] || 0) >= 11);
     
     // Violation 1: Merging two safe syndicates.
     if (safeSyndicates.length >= 2) return 'permanently_unplayable';
     
     // Violation 2: Founding an 8th syndicate.
-    if (adjSyndicates.length === 0 && adjPositions.length > 0 && lobbyInfo.active_chains.length >= 7) return 'temporarily_unplayable';
+    if (syndicates.length === 0 && cluster.length > 1 && lobbyInfo.active_chains.length >= 7) return 'temporarily_unplayable';
     
     return 'valid';
   };
