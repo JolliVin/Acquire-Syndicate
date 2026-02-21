@@ -610,7 +610,6 @@ export default function Home() {
   const secondaryBonus = assetPrice * 5;
   
   const activeVoters = players.filter(p => !p.is_spectator);
-  // Only rank players who actually own the stock
   const shareholders = activeVoters
     .filter(p => (p.stocks[corp] || 0) > 0)
     .sort((a, b) => (b.stocks[corp] || 0) - (a.stocks[corp] || 0));
@@ -621,34 +620,31 @@ export default function Home() {
   const primaryShareholders = shareholders.filter(p => p.stocks[corp] === maxStocks);
 
   if (primaryShareholders.length > 1) {
-    // Tie for Primary: Combined bonuses split and rounded up
+    // TIE FOR PRIMARY: Split combined bonuses
     const splitVal = Math.ceil((primaryBonus + secondaryBonus) / primaryShareholders.length / 100) * 100;
-    
     for (const op of primaryShareholders) {
-      await supabase.from('players').update({ money: op.money + splitVal }).eq('id', op.id);
+      await supabase.rpc('increment_money', { row_id: op.id, amount: splitVal });
     }
   } else {
-    // Single Primary holder
+    // SINGLE PRIMARY
     const primaryOp = primaryShareholders[0];
-    const remainingHolders = shareholders.filter(p => p.id !== primaryOp.id);
+    const remaining = shareholders.filter(p => p.id !== primaryOp.id);
 
-    if (remainingHolders.length === 0) {
-      // ONLY ONE OWNER: Gets Primary + Secondary
-      await supabase.from('players').update({ 
-        money: primaryOp.money + primaryBonus + secondaryBonus 
-      }).eq('id', primaryOp.id);
+    if (remaining.length === 0) {
+      // ONLY OWNER: Gets both
+      await supabase.rpc('increment_money', { row_id: primaryOp.id, amount: primaryBonus + secondaryBonus });
     } else {
-      // One Primary, check for Secondary ties
-      const secondMaxStocks = remainingHolders[0].stocks[corp];
-      const secondaryShareholders = remainingHolders.filter(p => p.stocks[corp] === secondMaxStocks);
+      // ONE PRIMARY + TIE/SINGLE SECONDARY
+      const secondMax = remaining[0].stocks[corp];
+      const secondaryShareholders = remaining.filter(p => p.stocks[corp] === secondMax);
       
       // Pay Primary
-      await supabase.from('players').update({ money: primaryOp.money + primaryBonus }).eq('id', primaryOp.id);
+      await supabase.rpc('increment_money', { row_id: primaryOp.id, amount: primaryBonus });
       
-      // Pay Secondary (Split if tied)
+      // Pay Secondary
       const splitSecondary = Math.ceil(secondaryBonus / secondaryShareholders.length / 100) * 100;
       for (const op of secondaryShareholders) {
-        await supabase.from('players').update({ money: op.money + splitSecondary }).eq('id', op.id);
+        await supabase.rpc('increment_money', { row_id: op.id, amount: splitSecondary });
       }
     }
   }
@@ -734,25 +730,24 @@ export default function Home() {
    * Liquidates operative cash in exchange for syndicate shares.
    */
   const handleBuyStock = async (syndicate: string) => {
-    if (!lobbyInfo || !me || lobbyInfo.is_paused) return;
-    
-    const sharePrice = getStockPrice(syndicate, lobbyInfo.chain_sizes[syndicate] || 0);
-    const vaultQuantity = lobbyInfo.available_stocks[syndicate] || 0;
-    
-    if (me.money < sharePrice || stocksBoughtThisTurn >= 3 || vaultQuantity <= 0) return;
-    
-    const newStockManifest = { ...(me.stocks || {}), [syndicate]: ((me.stocks || {})[syndicate] || 0) + 1 };
-    setStocksBoughtThisTurn(prevCount => prevCount + 1);
-    
-    await supabase.from('players').update({ 
-      money: me.money - sharePrice, 
-      stocks: newStockManifest 
-    }).eq('id', me.id);
-    
-    await supabase.from('lobbies').update({ 
-      available_stocks: { ...lobbyInfo.available_stocks, [syndicate]: vaultQuantity - 1 } 
-    }).eq('id', lobbyInfo.id);
-  };
+  if (!lobbyInfo || !me || lobbyInfo.is_paused) return;
+  
+  const sharePrice = getStockPrice(syndicate, lobbyInfo.chain_sizes[syndicate] || 0);
+  const vaultQuantity = lobbyInfo.available_stocks[syndicate] || 0;
+  
+  if (me.money < sharePrice || stocksBoughtThisTurn >= 3 || vaultQuantity <= 0) return;
+  
+  const newStockManifest = { ...(me.stocks || {}), [syndicate]: ((me.stocks || {})[syndicate] || 0) + 1 };
+  setStocksBoughtThisTurn(prevCount => prevCount + 1);
+  
+  // SECURE TRANSACTION: Deduct the price from current DB balance, then update stocks
+  await supabase.rpc('increment_money', { row_id: me.id, amount: -sharePrice });
+  await supabase.from('players').update({ stocks: newStockManifest }).eq('id', me.id);
+  
+  await supabase.from('lobbies').update({ 
+    available_stocks: { ...lobbyInfo.available_stocks, [syndicate]: vaultQuantity - 1 } 
+  }).eq('id', lobbyInfo.id);
+};
 
   /**
    * Handle Disposition
@@ -763,18 +758,25 @@ export default function Home() {
     
     const { survivor, current_defunct, defunct_corps, tile_placed } = lobbyInfo.merger_data;
     
-    let liquidity = me.money;
-    let portfolio = { ...me.stocks };
-
-    if (sellQty > 0) {
-      liquidity += sellQty * getStockPrice(current_defunct!, lobbyInfo.chain_sizes[current_defunct!]);
-    }
+    // 1. Calculate the payout value
+    const sellValue = sellQty * getStockPrice(current_defunct!, lobbyInfo.chain_sizes[current_defunct!]);
     
+    // 2. Prepare the new portfolio (stocks only)
+    let portfolio = { ...me.stocks };
     portfolio[current_defunct!] -= (sellQty + (tradeSets * 2));
     if (tradeSets > 0) {
       portfolio[survivor!] = (portfolio[survivor!] || 0) + tradeSets;
     }
 
+    // 3. SECURE MONEY UPDATE: Use RPC to add cash directly in DB
+    if (sellValue > 0) {
+      await supabase.rpc('increment_money', { row_id: me.id, amount: sellValue });
+    }
+    
+    // 4. Update stocks record (We removed money from this call to prevent overwrites)
+    await supabase.from('players').update({ stocks: portfolio }).eq('id', me.id);
+
+    // 5. Update the Bank's inventory
     let bankInventory = { ...lobbyInfo.available_stocks };
     bankInventory[current_defunct!] = (bankInventory[current_defunct!] || 0) + sellQty + (tradeSets * 2);
     bankInventory[survivor!] = Math.max(0, (bankInventory[survivor!] || 0) - tradeSets);
@@ -782,6 +784,7 @@ export default function Home() {
     const operatives = players.filter(p => !p.is_spectator);
     const nextDispositionIndex = (lobbyInfo.disposition_turn_index + 1) % operatives.length;
 
+    // Reset local UI counters
     setSellCount(0);
     setTradePairs(0);
 
@@ -790,7 +793,7 @@ export default function Home() {
       available_stocks: bankInventory
     };
 
-    // Check if full rotation of disposition is complete.
+    // 6. Check if full rotation of disposition is complete
     if (nextDispositionIndex === lobbyInfo.current_turn_index) {
       const globalOwnership = { ...lobbyInfo.tile_ownership };
       Object.keys(globalOwnership).forEach(key => {
@@ -800,7 +803,7 @@ export default function Home() {
       const pendingDefuncts = defunct_corps?.filter(c => c !== current_defunct) || [];
       
       if (pendingDefuncts.length > 0) {
-        // Multi-syndicate merger resolution: Move to next defunct chain.
+        // Multi-syndicate merger resolution: Move to next defunct chain
         await distributeBonuses(pendingDefuncts[0], lobbyInfo.chain_sizes[pendingDefuncts[0]]);
         lobbyTransmission = {
           ...lobbyTransmission,
@@ -814,7 +817,7 @@ export default function Home() {
           }
         };
       } else {
-        // Merger finalized. Returning to standard sequence.
+        // Merger finalized: Return to standard sequence
         const { cluster } = getClusterAndSyndicates(tile_placed!, lobbyInfo.board_state, lobbyInfo.tile_ownership);
         cluster.forEach(t => { globalOwnership[t] = survivor!; });
         
@@ -831,7 +834,7 @@ export default function Home() {
       }
     }
     
-    await supabase.from('players').update({ money: liquidity, stocks: portfolio }).eq('id', me.id);
+    // Final DB update for the lobby state
     await supabase.from('lobbies').update(lobbyTransmission).eq('id', lobbyInfo.id);
   };
 
@@ -894,29 +897,23 @@ export default function Home() {
     if (!finalOperativeList) return;
     
     for (const operative of finalOperativeList) {
-      let liquidationCash = operative.money;
-      CORPORATIONS.forEach(corp => {
-        if (operative.stocks[corp] > 0) {
-          liquidationCash += operative.stocks[corp] * getStockPrice(corp, lobbyInfo.chain_sizes[corp]);
-        }
-      });
-      
-      await supabase.from('players').update({ 
-        money: liquidationCash, 
-        stocks: {}, 
-        wants_to_swap: false, 
-        wants_restart: false 
-      }).eq('id', operative.id);
+  let totalLiquidationValue = 0;
+  CORPORATIONS.forEach(corp => {
+    if (operative.stocks[corp] > 0) {
+      totalLiquidationValue += operative.stocks[corp] * getStockPrice(corp, lobbyInfo.chain_sizes[corp]);
     }
-    
-    await supabase.from('lobbies').update({ 
-      status: 'finished', 
-      end_session_data: {},
-      is_paused: false,
-      reconnect_timer: null
-    }).eq('id', lobbyInfo.id);
-    
-    setIsWinnersTableOpen(true);
+  });
+  
+  // Add the stock value to whatever money they currently have in the DB
+  await supabase.rpc('increment_money', { row_id: operative.id, amount: totalLiquidationValue });
+  
+  // Clear stocks and flags
+  await supabase.from('players').update({ 
+    stocks: {}, 
+    wants_to_swap: false, 
+    wants_restart: false 
+  }).eq('id', operative.id);
+}
   };
 
   /**
